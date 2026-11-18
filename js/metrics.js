@@ -68,6 +68,12 @@ function definePoolMetrics(root) {
       inProgress: w.totals.pickedUp - w.totals.completed,
       stillWaiting: w.totals.requested - w.totals.pickedUp - w.totals.lost - w.totals.cancelled,
       zone: zoneStats(w),
+      turns: {
+        on: w.turns, rightDelay: cfg.rightTurnDelay,
+        left: w.totals.leftTurns, right: w.totals.rightTurns, u: w.totals.uTurns, wait: w.totals.turnWait,
+        legs: w.totals.legs, legsImproved: w.totals.legsImproved, saving: w.totals.legSaving,
+        examples: w.routeExamples,
+      },
       avgWait: mean(picked, wait),
       driverPay: w.totals.driverPay,
       premium: w.totals.premium,

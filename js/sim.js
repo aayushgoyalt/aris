@@ -42,6 +42,13 @@
  *    on the open grid), cabs inside drive out, impossible trips are cancelled
  *    or refused, riders headed into it are dropped at the nearest safe point,
  *    and plans that no longer fit are re-checked. With no zone, nothing changes.
+ *  - Traffic lights (rightTurnDelay > 0): driving a block still takes the same
+ *    time, but a right turn adds a delay at the light, a left turn 75% of it,
+ *    a U-turn 125% (only where there is no other way). Going straight is free,
+ *    and a cab leaving a stop may set off in any direction. Routes minimise
+ *    total time (Dijkstra over intersection + direction of travel), and cabs
+ *    really wait at the light, so planned times still equal actual times.
+ *    rightTurnDelay = 0 runs the original code paths unchanged.
  */
 // Wrapped in a named factory so app.js can also boot it inside a Web Worker.
 function definePoolSim(root) {
@@ -73,6 +80,7 @@ function definePoolSim(root) {
     parityFloor: 1,      // 1 = a pooled ride pays at least what the same riders pay the driver solo
     batchMatch: 0,       // 1 = cheapest rider-cab pairs across the queue first (with age priority)
     zoneRadius: 6,       // radius (blocks) of a threat zone declared by clicking the map
+    rightTurnDelay: 4,   // seconds a right turn adds at a light (0 = no traffic lights)
   };
 
   // The rules exactly as the original simulation implemented them.
@@ -87,6 +95,11 @@ function definePoolSim(root) {
   var REASSIGN_MIN_GAIN = 8;  // seconds of pickup a re-dispatch must save...
   var REASSIGN_MIN_RATIO = 0.7; // ...and the new ETA must be <= 70% of the old
   var AGE_WEIGHT = 2;         // batch matching: priority (rider-seconds) for time already waited
+  var LEFT_FACTOR = 0.75;     // a left turn takes 75% of a right turn's delay
+  var UTURN_FACTOR = 1.25;    // a U-turn (only where unavoidable) takes 125%
+  // Directions of travel, clockwise on screen (y grows downward): a right turn is +1.
+  var DIRX = [1, 0, -1, 0], DIRY = [0, 1, 0, -1]; // east, south, west, north
+  function dirOf(dx, dy) { return dx > 0 ? 0 : dy > 0 ? 1 : dx < 0 ? 2 : 3; }
   var EPS = 1e-6;
 
   function mulberry32(seed) {
@@ -133,6 +146,7 @@ function definePoolSim(root) {
     cfg.driverRate = Math.max(0, cfg.driverRate);
     cfg.costPerBlock = Math.max(0, cfg.costPerBlock);
     cfg.zoneRadius = clamp(cfg.zoneRadius, 1, cfg.gridSize);
+    cfg.rightTurnDelay = clamp(cfg.rightTurnDelay, 0, 60);
     ['fairPricing', 'driverFloor', 'parityFloor', 'batchMatch'].forEach(function (k) { cfg[k] = cfg[k] ? 1 : 0; });
     return cfg;
   }
@@ -161,6 +175,35 @@ function definePoolSim(root) {
     return { cabs: cabs, riders: riders };
   }
 
+  var heapK = null, heapV = null; // scratch heap for timeField, shared and reused
+
+  // Binary min-heap of (key, value) pairs, for Dijkstra.
+  function MinHeap() { this.keys = []; this.vals = []; this.size = 0; }
+  MinHeap.prototype.push = function (k, v) {
+    var i = this.size++, keys = this.keys, vals = this.vals;
+    while (i > 0) {
+      var p = (i - 1) >> 1;
+      if (keys[p] <= k) break;
+      keys[i] = keys[p]; vals[i] = vals[p]; i = p;
+    }
+    keys[i] = k; vals[i] = v;
+  };
+  MinHeap.prototype.topKey = function () { return this.keys[0]; };
+  MinHeap.prototype.pop = function () {
+    var keys = this.keys, vals = this.vals, top = vals[0], n = --this.size;
+    var k = keys[n], v = vals[n], i = 0;
+    while (true) {
+      var l = 2 * i + 1;
+      if (l >= n) break;
+      var c = l + 1 < n && keys[l + 1] < keys[l] ? l + 1 : l;
+      if (keys[c] >= k) break;
+      keys[i] = keys[c]; vals[i] = vals[c]; i = c;
+    }
+    keys[i] = k; vals[i] = v;
+    keys.length = vals.length = n;
+    return top;
+  };
+
   function World(cfg, scenario, poolEnabled) {
     this.cfg = cfg;
     this.poolEnabled = poolEnabled;
@@ -169,6 +212,11 @@ function definePoolSim(root) {
     this.Y = cfg.poolDiscount / 100;
     this.Y0 = cfg.requestDiscount / 100;
     this.fair = !!(poolEnabled && cfg.fairPricing);
+    this.turns = cfg.rightTurnDelay > 0;
+    this.rightDelay = cfg.rightTurnDelay;
+    this.tcache = { fields: {}, count: 0 }; // time-to-target fields (traffic lights), shared by twin cities
+    this.openArr = null;
+    this.routeExamples = []; // legs where the turn-aware route beat the x-then-y route
     this.steps = 0;
     this.t = 0;
     this.nextDispatchAt = 0;
@@ -189,9 +237,11 @@ function definePoolSim(root) {
       topUp: 0, floorTopUp: 0, parityTopUp: 0, detourCredit: 0,
       cancelled: 0, zoneCancelled: 0, zoneRefused: 0, zoneRequeued: 0, zoneEarlyDrops: 0,
       zoneRerouted: 0, zoneEvacuated: 0, zoneCapExceptions: 0, zoneRefund: 0,
+      leftTurns: 0, rightTurns: 0, uTurns: 0, turnWait: 0, legs: 0, legsImproved: 0, legSaving: 0,
     };
 
     var speed = this.speed;
+    var lights = this.turns, leftDelay = LEFT_FACTOR * cfg.rightTurnDelay;
     this.cabs = scenario.cabs.map(function (p, i) {
       return {
         id: i, x: p.x, y: p.y, next: null, progress: 0,
@@ -204,6 +254,9 @@ function definePoolSim(root) {
         topUp: 0,       // driver-guarantee top-ups, included in earnings
         ep: null,       // the busy stretch in progress
         evac: null,     // intersection it is driving to, to get out of a threat zone
+        heading: -1,    // direction of the last block driven (traffic lights)
+        stopped: true,  // parked or just served a stop: may set off in any direction
+        waitLeft: 0,    // seconds still to wait at a light before the next block
 
         planVersion: 0, rerouteVersion: 0,
         _base: null, _baseKey: '',
@@ -211,13 +264,17 @@ function definePoolSim(root) {
     });
     this.riders = scenario.riders.map(function (r) {
       var direct = manhattan(r.ox, r.oy, r.dx, r.dy);
+      // Solo estimate. With traffic lights, the fastest solo route is an L with
+      // its one turn a left (always possible from a standing start), if any turn.
+      var est = direct / speed;
+      if (lights && r.ox !== r.dx && r.oy !== r.dy) est += leftDelay;
       return {
         id: r.id, requestAt: r.requestAt, ox: r.ox, oy: r.oy, dx: r.dx, dy: r.dy,
         optIn: r.optIn,
         pool: poolEnabled && r.optIn,
         direct: direct,
-        est: direct / speed,
-        fullFare: direct / speed * cfg.fareRate,
+        est: est,
+        fullFare: est * cfg.fareRate,
         fare: 0,
         state: 'scheduled',     // scheduled -> waiting -> assigned -> riding -> done | lost
         cab: null,
@@ -225,7 +282,7 @@ function definePoolSim(root) {
         pickupAt: null, dropoffAt: null, lostAt: null,
         sharedSec: 0,
         detourCredit: 0,        // fair pricing: $ credited back for detour seconds
-        capBase: direct / speed, // in-car time the detour cap is measured against
+        capBase: est,           // in-car time the detour cap is measured against
         queuedAt: null,         // when the patience clock started (restarts if put back in the queue)
         dropDeadline: null,     // threat zone: latest drop-off committed for a rider already aboard
         earlyDrop: null,        // threat zone: safe intersection used instead of a destination inside it
@@ -270,7 +327,7 @@ function definePoolSim(root) {
     for (var guard = 0; guard < 10000; guard++) {
       if (!cab.next && cab.evac) {
         // Getting out of a threat zone comes before anything else.
-        if (cab.x === cab.evac.x && cab.y === cab.evac.y) cab.evac = null;
+        if (cab.x === cab.evac.x && cab.y === cab.evac.y) { cab.evac = null; cab.stopped = true; }
         else if (budget > EPS) { cab.next = lStep(cab.x, cab.y, cab.evac.x, cab.evac.y); cab.progress = 0; }
         else return;
       }
@@ -278,13 +335,37 @@ function definePoolSim(root) {
         this.serveStops(cab, now);
         if (!cab.plan.length) {
           cab.time.idle += budget / this.speed;
+          cab.stopped = true;
           return;
         }
         if (budget <= EPS) return;
         var s = cab.plan[0];
-        // L-shaped routing (x leg, then y leg), or around the threat zone.
-        cab.next = this.nextNode(cab.x, cab.y, s.x, s.y);
+        if (this.turns) {
+          // Fastest next block given the direction we're driving, and the wait
+          // at the light if it means turning.
+          var h0 = cab.stopped ? -1 : cab.heading;
+          if (cab.stopped) this.noteLeg(cab.x, cab.y, s.x, s.y);
+          var mv = this.chooseMove(cab.x, cab.y, h0, s.x, s.y);
+          this.countTurn(h0, mv.d);
+          cab.next = { x: mv.x, y: mv.y };
+          cab.waitLeft = mv.delay;
+        } else {
+          // L-shaped routing (x leg, then y leg), or around the threat zone.
+          cab.next = this.nextNode(cab.x, cab.y, s.x, s.y);
+        }
         cab.progress = 0;
+      }
+      if (cab.waitLeft > 0) {
+        // Waiting at a light: time passes, the cab doesn't move.
+        var wsec = Math.min(cab.waitLeft, budget / this.speed);
+        this.accrue(cab, wsec, 0);
+        this.totals.turnWait += wsec;
+        cab.waitLeft -= wsec;
+        budget -= wsec * this.speed;
+        now += wsec;
+        if (cab.waitLeft > EPS) return;
+        cab.waitLeft = 0;
+        if (budget <= EPS) return;
       }
       var move = Math.min(1 - cab.progress, budget);
       var sec = move / this.speed;
@@ -293,6 +374,8 @@ function definePoolSim(root) {
       budget -= move;
       now += sec;
       if (cab.progress >= 1 - EPS) {
+        cab.heading = dirOf(cab.next.x - cab.x, cab.next.y - cab.y);
+        cab.stopped = false;
         cab.x = cab.next.x;
         cab.y = cab.next.y;
         cab.next = null;
@@ -334,6 +417,7 @@ function definePoolSim(root) {
   World.prototype.serveStops = function (cab, now) {
     while (cab.plan.length && cab.plan[0].x === cab.x && cab.plan[0].y === cab.y) {
       var stop = cab.plan.shift();
+      cab.stopped = true;
       var r = stop.rider;
       cab.planVersion++;
       if (stop.type === 'pickup') {
@@ -438,6 +522,10 @@ function definePoolSim(root) {
   // Blocks the cab must still drive to reach (x, y) directly. A cab that is
   // mid-edge finishes the edge first.
   World.prototype.reach = function (cab, x, y) {
+    if (this.turns) {
+      var st = this.startState(cab);
+      return (st.t + this.legTime(st.x, st.y, st.h, x, y)) * this.speed; // time, in blocks of driving
+    }
     var d = 0, sx = cab.x, sy = cab.y;
     if (cab.next) { d = 1 - cab.progress; sx = cab.next.x; sy = cab.next.y; }
     if (cab.evac) { d += manhattan(sx, sy, cab.evac.x, cab.evac.y); sx = cab.evac.x; sy = cab.evac.y; }
@@ -452,22 +540,28 @@ function definePoolSim(root) {
   World.prototype.evalPlan = function (cab, plan, newRider, check, relaxAboard) {
     var speed = this.speed, limit = this.cfg.maxDetour;
     var maxPick = this.cfg.pingRadius / speed;
-    var t = this.t, x, y;
-    if (cab.next) {
-      t += (1 - cab.progress) / speed;
-      x = cab.next.x; y = cab.next.y;
+    var t = this.t, x, y, h = -1;
+    if (this.turns) {
+      var st = this.startState(cab);
+      t += st.t; x = st.x; y = st.y; h = st.h;
     } else {
-      x = cab.x; y = cab.y;
-    }
-    if (cab.evac) {
-      t += manhattan(x, y, cab.evac.x, cab.evac.y) / speed;
-      x = cab.evac.x; y = cab.evac.y;
+      if (cab.next) {
+        t += (1 - cab.progress) / speed;
+        x = cab.next.x; y = cab.next.y;
+      } else {
+        x = cab.x; y = cab.y;
+      }
+      if (cab.evac) {
+        t += manhattan(x, y, cab.evac.x, cab.evac.y) / speed;
+        x = cab.evac.x; y = cab.evac.y;
+      }
     }
     var load = cab.onboard.length;
     var picks = {}, drops = {}, newPick = null;
     for (var i = 0; i < plan.length; i++) {
       var s = plan[i], r = s.rider;
-      t += this.dist(x, y, s.x, s.y) / speed;
+      if (this.turns) { t += this.legTime(x, y, h, s.x, s.y); h = -1; } // every stop is a standing start
+      else t += this.dist(x, y, s.x, s.y) / speed;
       x = s.x; y = s.y;
       if (s.type === 'pickup') {
         load++;
@@ -719,8 +813,12 @@ function definePoolSim(root) {
           if (d <= radius + EPS && d / speed < bestEta) { bestEta = d / speed; bestCab = idle[j]; }
         }
         if (!bestCab || bestEta > cur - REASSIGN_MIN_GAIN || bestEta > cur * REASSIGN_MIN_RATIO) continue;
+        // With traffic lights, skipping a stop can cost the others a turn they
+        // used to get free at that stop, so the old cab's plan is re-checked.
+        var without = c.plan.filter(function (s) { return s.rider !== r; });
+        if (this.turns && !this.evalPlan(c, without, null, true)) continue;
 
-        c.plan = c.plan.filter(function (s) { return s.rider !== r; });
+        c.plan = without;
         c.riders.splice(c.riders.indexOf(r), 1);
         c.planVersion++;
         if (c.onboard.length) c.rerouteVersion++;
@@ -757,6 +855,7 @@ function definePoolSim(root) {
   // Blocks of driving from a to b. Manhattan distance with no zone; with a
   // zone, the shortest path over open intersections (Infinity if there is none).
   World.prototype.dist = function (ax, ay, bx, by) {
+    if (this.turns) return this.legTime(ax, ay, -1, bx, by) * this.speed; // standing start, in blocks of driving
     if (!this.zone) return manhattan(ax, ay, bx, by);
     var d = this.fieldTo(bx, by)[ax + ay * this.cfg.gridSize];
     return d < 0 ? Infinity : d;
@@ -807,11 +906,15 @@ function definePoolSim(root) {
   };
 
   // Intersections a cab will drive through from (x, y) to (tx, ty), for drawing.
-  World.prototype.routeNodes = function (x, y, tx, ty) {
+  // h: direction the cab is driving in (-1 = standing start).
+  World.prototype.routeNodes = function (x, y, tx, ty, h) {
     var out = [];
+    if (h == null) h = -1;
     for (var guard = 0; (x !== tx || y !== ty) && guard < 4 * this.cfg.gridSize * this.cfg.gridSize; guard++) {
-      var n = this.nextNode(x, y, tx, ty);
-      out.push(n);
+      var n;
+      if (this.turns) { n = this.chooseMove(x, y, h, tx, ty); h = n.d; }
+      else n = this.nextNode(x, y, tx, ty);
+      out.push({ x: n.x, y: n.y });
       x = n.x; y = n.y;
     }
     return out;
@@ -821,8 +924,238 @@ function definePoolSim(root) {
   // edge and, if it is inside a zone, after driving out.
   World.prototype.routeStart = function (cab) {
     var x = cab.next ? cab.next.x : cab.x, y = cab.next ? cab.next.y : cab.y;
-    if (cab.evac) { x = cab.evac.x; y = cab.evac.y; }
-    return { x: x, y: y };
+    var h = cab.next ? dirOf(cab.next.x - cab.x, cab.next.y - cab.y) : cab.stopped ? -1 : cab.heading;
+    if (cab.evac) { x = cab.evac.x; y = cab.evac.y; h = -1; }
+    return { x: x, y: y, h: h };
+  };
+
+  // ---------------------------------------------------------------- traffic lights
+
+  // Delay at a light for going from direction h to direction d.
+  World.prototype.turnCost = function (h, d) {
+    if (h < 0 || h === d) return 0;
+    var r = (d - h + 4) % 4;
+    return r === 1 ? this.rightDelay : r === 3 ? LEFT_FACTOR * this.rightDelay : UTURN_FACTOR * this.rightDelay;
+  };
+
+  World.prototype.openAt = function (x, y) {
+    var G = this.cfg.gridSize;
+    return x >= 0 && y >= 0 && x < G && y < G && !(this.zone && this.zone.mask[x + y * G]);
+  };
+
+  // A U-turn is only allowed where no other move exists.
+  World.prototype.uTurnAllowed = function (x, y, h) {
+    return !this.openAt(x + DIRX[h], y + DIRY[h])
+      && !this.openAt(x + DIRX[(h + 1) % 4], y + DIRY[(h + 1) % 4])
+      && !this.openAt(x + DIRX[(h + 3) % 4], y + DIRY[(h + 3) % 4]);
+  };
+
+  // Where the cab's route effectively starts, when, and in which direction it
+  // is driving: after any wait at the light and the rest of its current block,
+  // and after driving out of a zone (a standing start there).
+  World.prototype.startState = function (cab) {
+    var t = 0, x = cab.x, y = cab.y, h = cab.stopped ? -1 : cab.heading;
+    if (cab.next) {
+      t = cab.waitLeft + (1 - cab.progress) / this.speed;
+      h = dirOf(cab.next.x - cab.x, cab.next.y - cab.y);
+      x = cab.next.x; y = cab.next.y;
+    }
+    if (cab.evac) {
+      t += manhattan(x, y, cab.evac.x, cab.evac.y) / this.speed;
+      x = cab.evac.x; y = cab.evac.y; h = -1;
+    }
+    return { t: t, x: x, y: y, h: h };
+  };
+
+  // Seconds from every (intersection, direction just driven) to (tx, ty):
+  // Dijkstra run backwards from the target over open intersections, with the
+  // same move rules the cabs follow. Cached per target.
+  World.prototype.timeField = function (tx, ty) {
+    var G = this.cfg.gridSize, id = tx + ty * G, cache = this.tcache, T = cache.fields[id];
+    if (T) return T;
+    if (cache.count >= Math.max(64, Math.floor(3e7 / (G * G * 32)))) { cache.fields = {}; cache.count = 0; }
+    var n = G * G, open = this.openMask();
+    if (!this.costTab) {
+      // costTab[h * 4 + d]: one block plus the wait at the light for turning from h to d.
+      this.costTab = new Float64Array(16);
+      for (var a = 0; a < 4; a++) for (var b = 0; b < 4; b++) this.costTab[a * 4 + b] = 1 / this.speed + this.turnCost(a, b);
+    }
+    var cost = this.costTab;
+    T = new Float64Array(n * 4).fill(Infinity);
+    if (open[id]) {
+      var cap = n * 16;
+      if (!heapK || heapK.length < cap) { heapK = new Float64Array(cap); heapV = new Int32Array(cap); }
+      var hk = heapK, hv = heapV, size = 0, i, p, k, v;
+      var push = function (key, val) {
+        i = size++;
+        while (i > 0) { p = (i - 1) >> 1; if (hk[p] <= key) break; hk[i] = hk[p]; hv[i] = hv[p]; i = p; }
+        hk[i] = key; hv[i] = val;
+      };
+      for (var h0 = 0; h0 < 4; h0++) { T[id * 4 + h0] = 0; push(0, id * 4 + h0); }
+      while (size) {
+        var val = hk[0], st = hv[0];
+        // pop
+        size--; k = hk[size]; v = hv[size]; i = 0;
+        for (;;) {
+          var l = 2 * i + 1;
+          if (l >= size) break;
+          var c0 = l + 1 < size && hk[l + 1] < hk[l] ? l + 1 : l;
+          if (hk[c0] >= k) break;
+          hk[i] = hk[c0]; hv[i] = hv[c0]; i = c0;
+        }
+        hk[i] = k; hv[i] = v;
+        if (val > T[st]) continue;
+        var d = st & 3, m = st >> 2, mx = m % G, my = (m - mx) / G;
+        var px = mx - DIRX[d], py = my - DIRY[d];
+        if (px < 0 || py < 0 || px >= G || py >= G) continue;
+        var pn = px + py * G;
+        if (!open[pn]) continue;
+        var uh = (d + 2) & 3; // the one arrival direction for which this move is a U-turn
+        for (var h = 0; h < 4; h++) {
+          if (h === uh && !this.uTurnAllowed(px, py, h)) continue;
+          var c = val + cost[h * 4 + d], ps = pn * 4 + h;
+          if (c < T[ps] - 1e-12) { T[ps] = c; push(c, ps); }
+        }
+      }
+    }
+    cache.fields[id] = T;
+    cache.count++;
+    return T;
+  };
+
+  // 1 = open intersection (inside the grid and outside any threat zone).
+  World.prototype.openMask = function () {
+    if (this.openArr) return this.openArr;
+    var n = this.cfg.gridSize * this.cfg.gridSize, a = new Uint8Array(n).fill(1);
+    if (this.zone) for (var i = 0; i < n; i++) if (this.zone.mask[i]) a[i] = 0;
+    return (this.openArr = a);
+  };
+
+  World.prototype.resetRoutes = function () {
+    this.tcache.fields = {};
+    this.tcache.count = 0;
+    this.openArr = null;
+  };
+
+  // Exact fastest time on an open grid (no zone), from (x, y) driving in
+  // direction h (-1 = standing start). Checked against the full search for
+  // every state on several grids in the tests. In the driver's frame, with f
+  // blocks ahead and s blocks to the right:
+  //   standing start:           blocks, plus one left if a turn is needed
+  //   ahead (s = 0, f > 0):     blocks
+  //   ahead or level, left:     blocks + one left;   right: blocks + one right
+  //   behind-left:              blocks + two lefts;  behind-right: + two rights
+  //   directly behind:          loop round a block: blocks + 2, three lefts
+  //                             (three rights if the left side is off the grid)
+  World.prototype.openTime = function (x, y, h, tx, ty) {
+    var bT = 1 / this.speed, R = this.rightDelay, L = LEFT_FACTOR * R;
+    var ax = tx - x, ay = ty - y, man = Math.abs(ax) + Math.abs(ay);
+    if (!ax && !ay) return 0;
+    if (h < 0) return man * bT + (ax && ay ? L : 0);
+    var f = ax * DIRX[h] + ay * DIRY[h], r = (h + 1) % 4, s = ax * DIRX[r] + ay * DIRY[r];
+    if (s === 0 && f > 0) return f * bT;
+    if (f >= 0) return man * bT + (s < 0 ? L : R);
+    if (s < 0) return man * bT + 2 * L;
+    if (s > 0) return man * bT + 2 * R;
+    var l = (h + 3) % 4, G = this.cfg.gridSize, lx = x + DIRX[l], ly = y + DIRY[l];
+    var leftOK = lx >= 0 && ly >= 0 && lx < G && ly < G;
+    return (man + 2) * bT + (leftOK ? 3 * L : 3 * R);
+  };
+
+  // Seconds from (x, y), driving in direction h (-1 = standing start), to (tx, ty).
+  World.prototype.legTime = function (x, y, h, tx, ty) {
+    if (x === tx && y === ty) return 0;
+    if (!this.zone) return this.openTime(x, y, h, tx, ty);
+    var T = this.timeField(tx, ty), b = (x + y * this.cfg.gridSize) * 4;
+    if (h >= 0) return T[b + h];
+    return Math.min(T[b], T[b + 1], T[b + 2], T[b + 3]);
+  };
+
+  // The next block to drive: the move with the least time to go, preferring
+  // straight, then left, then right (any direction from a standing start).
+  World.prototype.chooseMove = function (x, y, h, tx, ty) {
+    var G = this.cfg.gridSize, T = this.zone ? this.timeField(tx, ty) : null, blockT = 1 / this.speed;
+    var order = h < 0 ? [0, 1, 2, 3] : [h, (h + 3) % 4, (h + 1) % 4];
+    var best = Infinity, bd = -1, bdelay = 0;
+    for (var i = 0; i < order.length; i++) {
+      var d = order[i], nx = x + DIRX[d], ny = y + DIRY[d];
+      if (!this.openAt(nx, ny)) continue;
+      var delay = this.turnCost(h, d);
+      var c = blockT + delay + (T ? T[(nx + ny * G) * 4 + d] : this.openTime(nx, ny, d, tx, ty));
+      if (c < best - 1e-12) { best = c; bd = d; bdelay = delay; }
+    }
+    if (bd < 0 && h >= 0 && this.uTurnAllowed(x, y, h)) {
+      bd = (h + 2) % 4;
+      bdelay = this.turnCost(h, bd);
+    }
+    if (bd < 0) { var l = lStep(x, y, tx, ty); return { x: l.x, y: l.y, d: dirOf(l.x - x, l.y - y), delay: 0 }; }
+    return { x: x + DIRX[bd], y: y + DIRY[bd], d: bd, delay: bdelay };
+  };
+
+  World.prototype.countTurn = function (h, d) {
+    if (h < 0 || h === d) return;
+    var r = (d - h + 4) % 4;
+    this.totals[r === 1 ? 'rightTurns' : r === 3 ? 'leftTurns' : 'uTurns']++;
+  };
+
+  // Distance, turns and time of the route a cab would drive.
+  World.prototype.describeRoute = function (x, y, h, tx, ty) {
+    var out = { blocks: 0, lefts: 0, rights: 0, uturns: 0, turnTime: 0 };
+    for (var guard = 0; (x !== tx || y !== ty) && guard < 4 * this.cfg.gridSize * this.cfg.gridSize; guard++) {
+      var mv = this.chooseMove(x, y, h, tx, ty);
+      if (h >= 0 && mv.d !== h) {
+        var r = (mv.d - h + 4) % 4;
+        out[r === 1 ? 'rights' : r === 3 ? 'lefts' : 'uturns']++;
+        out.turnTime += mv.delay;
+      }
+      out.blocks++;
+      x = mv.x; y = mv.y; h = mv.d;
+    }
+    out.time = out.blocks / this.speed + out.turnTime;
+    return out;
+  };
+
+  // The original route: the whole x leg, then the whole y leg (null if it
+  // would cross a threat zone).
+  World.prototype.describeXFirst = function (x, y, h, tx, ty) {
+    var out = { blocks: manhattan(x, y, tx, ty), lefts: 0, rights: 0, uturns: 0, turnTime: 0 };
+    var cx = x, cy = y, legs = [];
+    if (tx !== x) legs.push(tx > x ? 0 : 2);
+    if (ty !== y) legs.push(ty > y ? 1 : 3);
+    for (var guard = 0; (cx !== tx || cy !== ty) && guard < 4 * this.cfg.gridSize; guard++) {
+      var l = lStep(cx, cy, tx, ty);
+      if (!this.openAt(l.x, l.y)) return null;
+      cx = l.x; cy = l.y;
+    }
+    for (var i = 0; i < legs.length; i++) {
+      var d = legs[i];
+      if (h >= 0 && d !== h) {
+        var r = (d - h + 4) % 4;
+        out[r === 1 ? 'rights' : r === 3 ? 'lefts' : 'uturns']++;
+        out.turnTime += this.turnCost(h, d);
+      }
+      h = d;
+    }
+    out.time = out.blocks / this.speed + out.turnTime;
+    return out;
+  };
+
+  // At every standing start, compare the route taken with the original
+  // x-then-y route, for the report.
+  World.prototype.noteLeg = function (x, y, tx, ty) {
+    if (x === tx && y === ty) return;
+    var xf = this.describeXFirst(x, y, -1, tx, ty);
+    if (!xf) return;
+    var chosen = this.legTime(x, y, -1, tx, ty);
+    this.totals.legs++;
+    if (xf.time - chosen > EPS) {
+      this.totals.legsImproved++;
+      this.totals.legSaving += xf.time - chosen;
+      if (this.routeExamples.length < 3) {
+        this.routeExamples.push({ from: { x: x, y: y }, to: { x: tx, y: ty }, at: this.t,
+          chosen: this.describeRoute(x, y, -1, tx, ty), xFirst: xf });
+      }
+    }
   };
 
   function zoneReason(w, r) {
@@ -894,6 +1227,7 @@ function definePoolSim(root) {
     this.zoneHistory.push({ cx: cx, cy: cy, r: R, at: this.t, clearedAt: null });
     this.fields = {};
     this.fieldCount = 0;
+    this.resetRoutes();
 
     // 1. Cabs inside the zone get out first.
     for (i = 0; i < this.cabs.length; i++) this.secureCab(this.cabs[i]);
@@ -918,7 +1252,12 @@ function definePoolSim(root) {
     var moved = false;
     if (cab.next) {
       var fromIn = this.blocked(cab.x, cab.y), nextIn = this.blocked(cab.next.x, cab.next.y);
-      if (nextIn && !fromIn) {
+      if (nextIn && !fromIn && cab.progress < EPS) {
+        // About to set off into it: don't.
+        cab.next = null;
+        cab.waitLeft = 0;
+        moved = true;
+      } else if (nextIn && !fromIn) {
         // Heading in: turn around on the spot and go back the way it came.
         var to = cab.next;
         cab.next = { x: cab.x, y: cab.y };
@@ -1007,6 +1346,7 @@ function definePoolSim(root) {
     this.zone = null;
     this.fields = {};
     this.fieldCount = 0;
+    this.resetRoutes();
     var self = this;
     this.cabs.forEach(function (cab) {
       cab.evac = null;
@@ -1070,6 +1410,7 @@ function definePoolSim(root) {
     this.scenario = makeScenario(this.cfg);
     this.pool = new World(this.cfg, this.scenario, true);
     this.base = new World(this.cfg, this.scenario, false);
+    this.base.tcache = this.pool.tcache; // same streets, same lights, same zone: share the route fields
     this.zoneEvents = []; // declarations and clears, so a run can be replayed exactly
   }
 
@@ -1130,6 +1471,8 @@ function definePoolSim(root) {
     MAX_PLAN_STOPS: MAX_PLAN_STOPS,
     VEHICLE_WEIGHT: VEHICLE_WEIGHT,
     AGE_WEIGHT: AGE_WEIGHT,
+    LEFT_FACTOR: LEFT_FACTOR,
+    UTURN_FACTOR: UTURN_FACTOR,
     normalizeConfig: normalizeConfig,
     makeScenario: makeScenario,
     manhattan: manhattan,

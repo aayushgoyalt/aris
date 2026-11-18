@@ -755,6 +755,36 @@
       + deltaTable(groups, 'No Pool', 'With Pool') + '</section>';
   }
 
+  // Traffic lights: what the turn-aware routes did, and one leg compared.
+  function lightsSection(s) {
+    var tp = s.pool.turns, tb = s.base.turns, cfg = s.cfg;
+    if (!tp.on) return '';
+    var R = cfg.rightTurnDelay, L = R * 0.75, U = R * 1.25;
+    var groups = [['Turns', [
+      ['Left turns', tb.left, tp.left, fmt.int, 'int', null],
+      ['Right turns', tb.right, tp.right, fmt.int, 'int', null],
+      ['U-turns (only where unavoidable)', tb.u, tp.u, fmt.int, 'int', null],
+      ['Cab-seconds waiting at lights', tb.wait, tp.wait, fmt.int, 'int', false],
+      ['Legs where the fastest route beat x-then-y', tb.legsImproved, tp.legsImproved, fmt.int, 'int', null],
+      ['Seconds saved on those legs', tb.saving, tp.saving, fmt.int, 'int', true],
+    ]]];
+    var ex = tp.examples[0] || tb.examples[0], exHtml = '';
+    if (ex) {
+      var row = function (name, r) {
+        return '<tr><td>' + name + '</td><td>' + r.blocks + '</td><td>' + r.lefts + '</td><td>' + r.rights + '</td><td>' + fmt.sec(r.turnTime, 0) + '</td><td><b>' + fmt.sec(r.time, 0) + '</b></td></tr>';
+      };
+      exHtml = '<figure class="wide mt"><figcaption><b>One leg from this run</b><span>(' + ex.from.x + ', ' + ex.from.y + ') → (' + ex.to.x + ', ' + ex.to.y + '), leaving a stop at ' + fmt.sec(ex.at, 0) + '</span></figcaption>'
+        + '<table class="compare"><thead><tr><th>Route</th><th>Distance (blocks)</th><th>Left turns</th><th>Right turns</th><th>Turn time</th><th>Total time</th></tr></thead><tbody>'
+        + row('Fastest route (taken)', ex.chosen) + row('Original x-then-y route', ex.xFirst) + '</tbody></table></figure>';
+    }
+    return '<section class="rsec"><h3>Traffic lights</h3>'
+      + '<p class="lead">A right turn adds ' + fmt.sec(R, 0) + ' at the light, a left ' + fmt.sec(L, 2).replace('.00', '') + ' (75%), a U-turn ' + fmt.sec(U, 2).replace('.00', '') + ' (125%, only where there is no other way); straight is free, and so is setting off from a stop. '
+      + 'Every route, estimate, fare, ping radius and detour cap uses this total time, and cabs really wait at the light. '
+      + 'On this grid the fastest route is never longer than the shortest: avoiding one right turn means looping a block, two extra blocks and three lefts (' + fmt.sec(2 / cfg.cabSpeed + 3 * L, 0) + ' vs ' + fmt.sec(R, 0) + '). '
+      + 'What the lights change is which of the equally short routes is taken: the one whose turns are lefts.</p>'
+      + deltaTable(groups, 'No Pool', 'With Pool') + exHtml + '</section>';
+  }
+
   var STATES = [
     { key: 'idle', label: 'Idle', cls: 'st-idle', dark: true },
     { key: 'empty', label: 'Driving empty', cls: 'st-empty', dark: true },
@@ -792,6 +822,7 @@
       ['Pricing', cfg.fairPricing ? 'fair (Y0 ' + cfg.requestDiscount + '%, credit ' + cfg.detourCredit + '%)' : 'flat'],
       ['Guarantee', cfg.parityFloor && cfg.driverFloor ? 'parity + floor' : cfg.parityFloor ? 'parity' : cfg.driverFloor ? 'floor' : 'off'],
       ['Matching', cfg.batchMatch ? 'batch' : 'oldest first'],
+      ['Lights', cfg.rightTurnDelay > 0 ? 'right +' + cfg.rightTurnDelay + ' s, left +' + (cfg.rightTurnDelay * 0.75) + ' s' : 'off'],
       ['Threat zone', pw.zone.declared ? pw.zone.history.map(function (h) { return '(' + h.cx + ', ' + h.cy + ') r ' + h.r; }).join(', ') : 'none'],
       ['Seed', cfg.seed],
     ].map(function (x) { return '<span class="chip"><b>' + x[0] + '</b> ' + x[1] + '</span>'; }).join('');
@@ -869,6 +900,8 @@
       + '</figure></section>'
 
       + zoneSection(s)
+
+      + lightsSection(s)
 
       + economicsSection(s)
 

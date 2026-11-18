@@ -241,6 +241,7 @@ input:disabled { cursor: not-allowed; opacity: 0.5; }
 .sw.shared { background: var(--shared); width: 12px; height: 12px; box-shadow: 0 0 0 3px color-mix(in srgb, var(--shared) 22%, transparent); }
 .sw.ring { border: 2.5px solid var(--pool1); }
 .sw.idle { background: var(--idle); width: 8px; height: 8px; }
+.sw.light { width: 10px; height: 10px; border-radius: 50%; background: var(--idle); box-shadow: inset -3px 3px 0 -1px var(--bad); }
 .sw.zone { width: 12px; height: 12px; border-radius: 50%; border: 1.5px dashed var(--bad); background: var(--bad-wash); }
 .sw.cancel { width: 10px; height: 10px; border-radius: 50%; border: 1.5px solid var(--bad); background: linear-gradient(135deg, transparent 44%, var(--bad) 44%, var(--bad) 56%, transparent 56%); }
 .zone-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 8px 10px; margin-top: 12px; font-size: 12px; color: var(--ink-2); }

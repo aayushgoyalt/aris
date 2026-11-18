@@ -43,6 +43,7 @@ const SCENARIOS = [
   { batchMatch: 1, cabs: 10, maxDetour: 2, seed: 6 },
 ];
 const ORIGINAL = S.ORIGINAL_RULES;
+const NO_LIGHTS = { rightTurnDelay: 0 }; // the original city had no traffic lights
 const cache = new Map();
 function finished(over) {
   const key = JSON.stringify(over);
@@ -243,9 +244,9 @@ function fingerprint(w) {
   return [w.totals.completed, w.totals.lost, +w.totals.revenue.toFixed(6), +w.totals.driverPay.toFixed(6), +d.toFixed(4), +p.toFixed(4)];
 }
 
-test('regression: "Original rules" reproduce the original engine exactly (9 cities, both worlds)', () => {
+test('regression: "Original rules" with no traffic lights reproduce the original engine exactly (9 cities, both worlds)', () => {
   for (const ref of ORIGINAL_FINGERPRINTS) {
-    const s = sim(Object.assign({}, ref.over, ORIGINAL)).runToEnd();
+    const s = sim(Object.assign({}, ref.over, ORIGINAL, NO_LIGHTS)).runToEnd();
     assert.deepStrictEqual(fingerprint(s.pool), ref.pool, 'pool world differs for ' + JSON.stringify(ref.over));
     assert.deepStrictEqual(fingerprint(s.base), ref.base, 'no-pool world differs for ' + JSON.stringify(ref.over));
   }
@@ -253,7 +254,7 @@ test('regression: "Original rules" reproduce the original engine exactly (9 citi
 
 test('the no-pool world is untouched by fair pricing and the driver guarantee', () => {
   for (const ref of ORIGINAL_FINGERPRINTS) {
-    const s = sim(ref.over).runToEnd(); // enhanced defaults
+    const s = sim(Object.assign({}, ref.over, NO_LIGHTS)).runToEnd(); // enhanced rules, no lights
     assert.deepStrictEqual(fingerprint(s.base), ref.base, JSON.stringify(ref.over));
     assert.strictEqual(s.base.totals.topUp, 0);
   }
@@ -261,7 +262,7 @@ test('the no-pool world is untouched by fair pricing and the driver guarantee', 
 
 // A city built by hand: one cab at (0, 0), riders on a straight street.
 function handCity(riders, over) {
-  const cfg = S.normalizeConfig(Object.assign({ cabs: 1, riders: 0, duration: 120, pingRadius: 100 }, over));
+  const cfg = S.normalizeConfig(Object.assign({ cabs: 1, riders: 0, duration: 120, pingRadius: 100, rightTurnDelay: 0 }, over));
   const scenario = {
     cabs: [{ x: 0, y: 0 }],
     riders: riders.map((r, i) => Object.assign({ id: i, optIn: true }, r)),
@@ -420,7 +421,7 @@ function checkZone(w) {
 
 // A hand-built city with zone events: [{ t, x, y }] declares, [{ t, clear: true }] clears.
 function zoneCity(riders, over, events, cabs) {
-  const cfg = S.normalizeConfig(Object.assign({ cabs: 1, riders: 0, duration: 120, pingRadius: 100, zoneRadius: 2 }, over));
+  const cfg = S.normalizeConfig(Object.assign({ cabs: 1, riders: 0, duration: 120, pingRadius: 100, zoneRadius: 2, rightTurnDelay: 0 }, over));
   const w = new S.World(cfg, { cabs: cabs || [{ x: 0, y: 0 }], riders: riders.map((r, i) => Object.assign({ id: i, optIn: true }, r)) }, true);
   const evs = (events || []).slice();
   while (w.t < cfg.duration - EPS) {
@@ -579,6 +580,105 @@ test('zone: the comparison re-run replays the zone exactly', () => {
   const live = M.scorecard(M.summarize(s));
   const replay = M.scorecardAt(S.DEFAULTS, s.t, s.zoneEvents);
   assert.deepStrictEqual(replay, live);
+});
+
+// ------------------------------------------------------------ traffic lights
+
+const LIGHTS = { rightTurnDelay: 4 }; // right turn +4 s, left +3 s, U-turn +5 s, straight free
+
+test('lights: a left turn costs 75% of a right, a U-turn 125%, straight nothing; leaving a stop is free', () => {
+  const w = new S.World(S.normalizeConfig(Object.assign({ cabs: 1, riders: 0 }, LIGHTS)), { cabs: [{ x: 0, y: 0 }], riders: [] }, true);
+  // headings: 0 east, 1 south, 2 west, 3 north; clockwise on screen = right
+  assert.strictEqual(w.turnCost(0, 0), 0);
+  assert.strictEqual(w.turnCost(0, 1), 4);   // east -> south: right
+  assert.strictEqual(w.turnCost(0, 3), 3);   // east -> north: left
+  assert.strictEqual(w.turnCost(0, 2), 5);   // U-turn
+  assert.strictEqual(w.turnCost(-1, 2), 0);  // standing start
+  assert.strictEqual(S.LEFT_FACTOR, 0.75);
+});
+
+test('lights: the fastest route between two points picks the left turn over the original right turn', () => {
+  const w = new S.World(S.normalizeConfig(Object.assign({ cabs: 1, riders: 0 }, LIGHTS)), { cabs: [{ x: 0, y: 0 }], riders: [] }, true);
+  const chosen = w.describeRoute(10, 10, -1, 15, 15, -1);
+  const xFirst = w.describeXFirst(10, 10, -1, 15, 15);
+  assert.deepStrictEqual([chosen.blocks, chosen.lefts, chosen.rights, chosen.turnTime, chosen.time], [10, 1, 0, 3, 13]);
+  assert.deepStrictEqual([xFirst.blocks, xFirst.lefts, xFirst.rights, xFirst.turnTime, xFirst.time], [10, 0, 1, 4, 14]);
+});
+
+test('lights: driving east with the target directly behind -> no U-turn, a loop of three lefts (14 s, not 17 s)', () => {
+  const w = new S.World(S.normalizeConfig(Object.assign({ cabs: 1, riders: 0 }, LIGHTS)), { cabs: [{ x: 0, y: 0 }], riders: [] }, true);
+  const r = w.describeRoute(10, 10, 0, 7, 10);
+  assert.deepStrictEqual([r.blocks, r.lefts, r.rights, r.uturns, r.time], [5, 3, 0, 0, 14]);
+});
+
+test('lights: the closed-form open-grid times equal the full route search, for every state', () => {
+  for (const over of [{ gridSize: 10 }, { gridSize: 10, cabSpeed: 2.5, rightTurnDelay: 7 }, { gridSize: 12, cabSpeed: 0.5, rightTurnDelay: 1 }]) {
+    const cfg = S.normalizeConfig(Object.assign({ cabs: 1, riders: 0 }, LIGHTS, over)), G = cfg.gridSize;
+    const w = new S.World(cfg, { cabs: [{ x: 0, y: 0 }], riders: [] }, true);
+    for (let ty = 0; ty < G; ty++) for (let tx = 0; tx < G; tx++) {
+      const T = w.timeField(tx, ty);
+      for (let y = 0; y < G; y++) for (let x = 0; x < G; x++) for (let h = 0; h < 4; h++) {
+        assert(Math.abs(T[(x + y * G) * 4 + h] - w.openTime(x, y, h, tx, ty)) < 1e-9, `(${x},${y},${h}) -> (${tx},${ty})`);
+      }
+    }
+  }
+});
+
+test('lights: on this grid a longer route is never faster (every state, every target)', () => {
+  // Fastest route vs the shortest legal route (same move rules, near-zero light delays).
+  const G = 12;
+  const fast = new S.World(S.normalizeConfig(Object.assign({ gridSize: G, cabs: 1, riders: 0 }, LIGHTS)), { cabs: [{ x: 0, y: 0 }], riders: [] }, true);
+  const short = new S.World(S.normalizeConfig({ gridSize: G, cabs: 1, riders: 0, rightTurnDelay: 1e-6 }), { cabs: [{ x: 0, y: 0 }], riders: [] }, true);
+  for (let y = 0; y < G; y++) for (let x = 0; x < G; x++) for (let h = -1; h < 4; h++) for (let ty = 0; ty < G; ty += 3) for (let tx = 0; tx < G; tx += 3) {
+    if (x === tx && y === ty) continue;
+    assert.strictEqual(fast.describeRoute(x, y, h, tx, ty).blocks, short.describeRoute(x, y, h, tx, ty).blocks);
+  }
+});
+
+test('lights: a cab really waits at the light, and arrives exactly when planned', () => {
+  // Rider (0,0) -> (5,5): south then east is one left (3 s): 10 + 3 = 13 s, the quoted estimate.
+  const w = handCity([{ requestAt: 0, ox: 0, oy: 0, dx: 5, dy: 5 }], LIGHTS);
+  const A = w.riders[0];
+  assert(Math.abs(A.est - 13) < 1e-9);
+  assert(Math.abs(inCar(A) - 13) < 1e-6, `in car ${inCar(A)}`);
+  assert.deepStrictEqual([w.totals.leftTurns, w.totals.rightTurns], [1, 0]);
+  assert(Math.abs(w.totals.turnWait - 3) < 1e-6);
+  assert(Math.abs(A.fullFare - 13 * w.cfg.fareRate) < 1e-9, 'fare quoted on the time including the light');
+});
+
+test('lights: planned drop-off times equal actual ones in a busy city (pooling, rerouting, re-dispatch)', () => {
+  for (const over of [LIGHTS, Object.assign({ riders: 400, cabs: 40, seed: 3 }, LIGHTS), Object.assign({ batchMatch: 1 }, LIGHTS)]) {
+    const s = sim(over), planned = new Map();
+    while (!s.done) {
+      s.step();
+      for (const c of s.pool.cabs) {
+        if (!c.onboard.length) continue;
+        const res = s.pool.evalPlan(c, c.plan, null, false);
+        for (const r of c.onboard) planned.set(r.id, res.drops[r.id]);
+      }
+    }
+    for (const r of s.pool.riders) {
+      if (r.state === 'done' && planned.has(r.id)) assert(Math.abs(r.dropoffAt - planned.get(r.id)) < 1e-6, `rider ${r.id}`);
+    }
+  }
+});
+
+test('lights: with a threat zone, routes still avoid it, and planned time = actual time', () => {
+  let plannedDrop = null;
+  const cfg = S.normalizeConfig(Object.assign({ cabs: 1, riders: 0, duration: 120, pingRadius: 100, zoneRadius: 2 }, LIGHTS));
+  const w = new S.World(cfg, { cabs: [{ x: 0, y: 0 }], riders: [{ id: 0, optIn: true, requestAt: 0, ox: 0, oy: 0, dx: 20, dy: 0 }] }, true);
+  while (w.t < cfg.duration - EPS) {
+    if (Math.abs(w.t - 2) < 1e-6) {
+      w.declareZone(10, 0);
+      plannedDrop = w.evalPlan(w.cabs[0], w.cabs[0].plan, null, false).drops[0];
+    }
+    w.step();
+    checkZone(w);
+  }
+  const A = w.riders[0];
+  assert.strictEqual(A.state, 'done');
+  assert(Math.abs(A.dropoffAt - plannedDrop) < 1e-6, `dropped at ${A.dropoffAt}, planned ${plannedDrop}`);
+  assert(w.totals.leftTurns + w.totals.rightTurns >= 2, 'turned round the zone');
 });
 
 console.log(`\n${passed} passed${process.exitCode ? ', some FAILED' : ''}`);

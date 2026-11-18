@@ -120,7 +120,7 @@
     var w = this.world, p = this.cabPoint(cab);
     var to = function (x, y) { ctx.lineTo(g.pad + x * g.cell, g.pad + y * g.cell); };
     ctx.moveTo(p.x, p.y);
-    var cx = cab.x, cy = cab.y;
+    var cx = cab.x, cy = cab.y, h = w.routeStart(cab).h;
     if (cab.next) {
       cx = cab.next.x; cy = cab.next.y;
       to(cx, cy);
@@ -132,8 +132,9 @@
     }
     for (var i = 0; i < cab.plan.length; i++) {
       var s = cab.plan[i];
-      if (w.zone) {
-        w.routeNodes(cx, cy, s.x, s.y).forEach(function (n) { to(n.x, n.y); });
+      if (w.zone || w.turns) {
+        w.routeNodes(cx, cy, s.x, s.y, h).forEach(function (n) { to(n.x, n.y); });
+        h = -1; // every stop is a standing start
       } else {
         if (s.x !== cx) to(s.x, cy);
         to(s.x, s.y);
@@ -360,6 +361,13 @@
         ctx.fillStyle = color;
         ctx.beginPath();
         ctx.arc(pt.x, pt.y, radius, 0, Math.PI * 2);
+        ctx.fill();
+      }
+      if (c.waitLeft > 0) {
+        // Waiting at a light to turn.
+        ctx.fillStyle = th.bad;
+        ctx.beginPath();
+        ctx.arc(pt.x + radius * 0.9, pt.y - radius * 0.9, Math.max(1.6, radius * 0.42), 0, Math.PI * 2);
         ctx.fill();
       }
       if (c.evac) {

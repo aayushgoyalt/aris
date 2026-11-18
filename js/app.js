@@ -47,6 +47,11 @@
       ],
     },
     {
+      group: 'Traffic lights', items: [
+        { key: 'rightTurnDelay', label: 'Right-turn delay', unit: 's', min: 0, max: 20, step: 1, hint: 'Added at the light for every right turn. A left turn adds 75% of it, a U-turn 125% (only where there is no other way). Straight is free, and leaving a stop is free. Routes minimise total time. 0 = no traffic lights.' },
+      ],
+    },
+    {
       group: 'City & money', items: [
         { key: 'gridSize', label: 'Grid', unit: 'per side', min: 10, max: 100, step: 5, hint: 'Intersections per side of the Manhattan grid.' },
         { key: 'cabSpeed', label: 'Cab speed', unit: 'blocks/s', min: 0.5, max: 5, step: 0.5, decimals: 1 },
@@ -193,11 +198,12 @@
   }
 
   function rulesLabel(cfg) {
-    if (isOriginalRules(cfg)) return 'original rules';
+    if (isOriginalRules(cfg)) return cfg.rightTurnDelay > 0 ? 'original rules + lights' : 'original rules';
     var parts = [];
     if (cfg.fairPricing) parts.push('fair pricing');
     if (cfg.parityFloor || cfg.driverFloor) parts.push('driver guarantee');
     if (cfg.batchMatch) parts.push('batch matching');
+    if (cfg.rightTurnDelay > 0) parts.push('lights');
     return parts.join(' + ');
   }
 
@@ -453,6 +459,18 @@
     return '<div class="tip-rider">' + head + '<div class="tip-muted">' + detail + '</div></div>';
   }
 
+  // The route to the next stop vs the original x-then-y route.
+  function legLine(world, cab) {
+    if (!world.turns || !cab.plan.length) return '';
+    var st = world.routeStart(cab), s = cab.plan[0];
+    if (st.x === s.x && st.y === s.y) return '';
+    var a = world.describeRoute(st.x, st.y, st.h, s.x, s.y), b = world.describeXFirst(st.x, st.y, st.h, s.x, s.y);
+    var line = function (r) { return r.blocks + ' blocks · ' + r.lefts + ' left · ' + r.rights + ' right' + (r.uturns ? ' · ' + r.uturns + ' U' : '') + ' · ' + fmt.sec(r.turnTime, 0) + ' at lights · <b>' + fmt.sec(r.time, 0) + '</b>'; };
+    return '<div class="tip-rider"><div class="tip-row">To next stop</div>'
+      + '<div class="tip-muted">Route taken: ' + line(a) + '</div>'
+      + '<div class="tip-muted">x-then-y route: ' + (b ? line(b) : 'blocked by the threat zone') + '</div></div>';
+  }
+
   function showCabTip(view, cab, e) {
     var world = view.world;
     var n = cab.onboard.length;
@@ -465,8 +483,9 @@
     times = cab.plan.map(function (s) {
       return s.type === 'pickup' ? times.picks[s.rider.id] : times.drops[s.rider.id];
     });
-    var html = '<div class="tip-title">Cab ' + cab.id + ' · ' + status + '</div>';
+    var html = '<div class="tip-title">Cab ' + cab.id + ' · ' + status + (cab.waitLeft > 0 ? ' · waiting ' + fmt.sec(cab.waitLeft) + ' at a light' : '') + '</div>';
     cab.riders.forEach(function (r) { html += riderLine(world, cab, r, times); });
+    html += legLine(world, cab);
     html += '<div class="tip-rider"><div class="tip-row">Earned<b>' + fmt.money(cab.earnings) + '</b></div>'
       + (cab.premium > 0 ? '<div class="tip-row tip-muted">incl. 2-aboard premium<b>' + fmt.money(cab.premium) + '</b></div>' : '')
       + (cab.topUp > 0 ? '<div class="tip-row tip-muted">incl. guarantee top-ups<b>' + fmt.money(cab.topUp) + '</b></div>' : '')
@@ -645,7 +664,8 @@
     var job = ++sweepJob;
     var radii = Metrics.sweepRadii(cfg);
     // Average over 3 random cities unless the city is big enough to be slow.
-    var seeds = cfg.riders <= 400 && cfg.duration <= 600 ? 3 : 1;
+    // A threat zone means full route searches, so one city keeps the sweep quick.
+    var seeds = cfg.riders <= 400 && cfg.duration <= 600 && !events.length ? 3 : 1;
     var points = new Array(radii.length), done = 0;
 
     function show(entry) {
@@ -757,7 +777,7 @@
   // Every enhancement off: behaves exactly like the original simulation.
   els.original.addEventListener('click', function () {
     if (isLocked()) return;
-    Object.assign(state.cfg, Sim.ORIGINAL_RULES);
+    Object.assign(state.cfg, Sim.ORIGINAL_RULES, { rightTurnDelay: 0 }); // the original city had no lights
     syncControls();
     newRun();
   });

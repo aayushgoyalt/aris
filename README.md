@@ -7,7 +7,8 @@ alone. The riders, their request times and the cab start positions are identical
 the two maps comes from pooling and nothing else.
 
 On top of the original simulation I added a driver earnings guarantee, fairer pool pricing, an optional batch matcher,
-a side-by-side comparison with the original rules, and a threat zone you can declare anywhere on the map while the city runs.
+a side-by-side comparison with the original rules, a threat zone you can declare anywhere on the map while the city runs,
+and traffic lights that make right turns cost time.
 
 ## Running it
 
@@ -76,33 +77,37 @@ dense and does nothing otherwise, which is why it's off by default.
 **Threat zone.** A closed circular area you can declare at any moment by clicking the map. Cabs are routed around it, and every
 affected ride is handled safely. More detail below.
 
+**Traffic lights.** Right turns stop at a light and cost time; left turns cost less. Routes are chosen by total time, not
+distance. More detail below.
+
 I also fixed two smaller bugs: the radius sweep showed "0 s" where it had no data, and the engine accepted impossible
 inputs such as a 150% discount.
 
-The **Original rules** button in the sidebar turns the guarantee, fair pricing and batch matching off. The app then behaves exactly
-like the original simulation, and a test checks this against outputs recorded before any of these changes. The threat zone
-changes nothing unless you declare one.
+The **Original rules** button in the sidebar turns the guarantee, fair pricing, batch matching and the traffic lights off. The app then
+behaves exactly like the original simulation, and a test checks this against outputs recorded before any of these changes. The threat
+zone changes nothing unless you declare one.
 
 ## Results
 
-These are averages over five cities: original rules on the left of each arrow, the new defaults on the right.
+These are averages over five cities with traffic lights on (the default). Original pricing on the left of each arrow, the new
+pricing and guarantee on the right.
 
 | | Default fleet (30 cabs) | Too few cabs (15) | Too many cabs (60) |
 |---|---|---|---|
-| Pooled rides paying the driver less than solo | 13.4 → 0 | 5.8 → 0 | 11.2 → 0 |
-| Discount to riders who never shared | $154 → $51 | $27 → $9 | $344 → $115 |
-| Platform margin, after paying the guarantee | $602 → $618 | $397 → $320 | $635 → $842 |
-| Saving for the rider already aboard | $6.06 → $7.95 | $5.30 → $7.13 | $6.52 → $7.79 |
+| Pooled rides paying the driver less than solo | 6.6 → 0 | 3.2 → 0 | 7.4 → 0 |
+| Discount to riders who never shared | $156 → $52 | $35 → $12 | $408 → $136 |
+| Platform margin, after paying the guarantee | $539 → $564 | $331 → $280 | $640 → $901 |
+| Saving for the rider already aboard | $6.35 → $9.15 | $5.66 → $8.03 | $7.10 → $9.22 |
 
-With low pay ($0.10/s) and high running costs ($0.12/block), pooled rides that lost the driver money went from 36 per
+With low pay ($0.10/s) and high running costs ($0.12/block), pooled rides that lost the driver money went from 19 per
 run to 0.
 
 The trade-off is that margin falls when cabs are scarce. In that case most riders do get matched, so they earn the full discount
 and drivers collect their top-ups. Both discounts are adjustable.
 
 Pricing and the guarantee only move money, so rides delivered and wait times don't change. Batch matching is the only addition
-that changes who rides when: with 400 riders it delivered 240 rides instead of 232, but with too few cabs a couple
-more riders gave up.
+that changes who rides when: with 400 riders it delivered 208 rides instead of 204 and cut the average wait by 3 s, but with
+too few cabs it made no real difference. That's why it stays off by default.
 
 ## Threat zone
 
@@ -130,12 +135,63 @@ The status bar under the maps keeps count for each city: cabs rerouted, cabs tha
 in the queue, and riders dropped short. The report adds a *Threat zone* section with the same numbers broken down by reason. The radius sweep
 and the comparison replay the zone at the same moment, so their numbers match the run you watched.
 
+## Traffic lights
+
+Driving a block takes the same time as before. On top of that, a turn at a light adds a delay:
+
+| Move at an intersection | Added time (default) | Rule |
+|---|---|---|
+| Straight on | 0 s | free |
+| Left turn | 3 s | 75% of a right turn (no stop at the light) |
+| Right turn | 4 s | stops at the light; set by the *Right-turn delay* slider |
+| U-turn | 5 s | 125% of a right turn, and only where there's no other way |
+
+A few assumptions:
+
+- A cab leaving a pickup or drop-off has just stopped, so it can set off in any direction with no delay. Turns only cost time
+  when the cab is already driving.
+- Driving out of a threat zone ignores the lights.
+- *Right-turn delay* = 0 means no traffic lights, and the original code runs unchanged.
+
+**How routes are chosen.** A route's time is `blocks ÷ speed + the delays of its turns`. With a threat zone active, the engine
+searches over (intersection, direction of travel) with Dijkstra's algorithm, using the same move rules the cabs follow. Without
+a zone there's an exact formula, written from the driver's point of view:
+
+- **target straight ahead:** the blocks;
+- **ahead or level, to the left:** blocks + one left; **to the right:** blocks + one right;
+- **behind-left:** blocks + two lefts; **behind-right:** blocks + two rights;
+- **directly behind:** a loop round a block (two extra blocks and three lefts, or three rights along the grid edge);
+- **from a standing start:** blocks, plus one left if the trip needs a turn at all.
+
+A test checks this formula against the full search for every position, direction and target on three different grids.
+
+Cabs choose each block by the same numbers and really wait at the light, so arrival times still match the plan to the
+microsecond. Matching, pooled insertions, re-dispatch, the ping radius (now "within R blocks' worth of driving time"), the
+1.5× detour cap and the fare estimate all use these times.
+
+**Can a longer route be faster? Not with this rule, and here's why.** Steering around one right turn means looping a block:
+two extra blocks and three lefts. That's 2 s + 3 × 3 s = 11 s instead of the 4 s right turn. The same holds for any delay: three lefts
+cost 2.25 right turns. And among equally short routes there's always one whose turns are lefts. A longer route would only win if
+a left cost less than a third of a right. A test checks this for every position, direction and target on a 12 × 12 grid.
+
+What the lights do change is **which of the equally short routes is taken**. The original engine always drove the whole x leg first,
+so about half its trips made a right turn where an equally short left-turn route existed. The report shows a real leg from the run,
+for example:
+
+| (41, 1) → (35, 0) | Distance | Left turns | Right turns | Turn time | Total |
+|---|---|---|---|---|---|
+| Fastest route (taken) | 7 blocks | 1 | 0 | 3 s | 10 s |
+| Original x-then-y route | 7 blocks | 0 | 1 | 4 s | 11 s |
+
+In the default run, cabs in the pool city made 274 left turns and 7 right turns. On 144 legs the fastest route beat the x-then-y
+route, saving 144 s of driving. Hovering over a cab shows the same comparison for its next leg.
+
 ## Try it
 
 Set the speed to 50× and each run takes a few seconds.
 
 1. Press **Start** with the defaults. In the report, scroll to *Original rules vs enhanced rules*. Pooled rides paying
-   the driver less than solo go from 12 to 0, and margin goes from $576 to $645, with 163 riders delivered under both.
+   the driver less than solo go from 7 to 0, and margin goes from $496 to $506, with 146 riders delivered under both.
 2. Set driver pay to 0.10, running cost to 0.12 and ping radius to 40, then run again. Under *Fair pool economics*,
    pooled rides that left the driver below $0 go to 0.
 3. Turn off both guarantee switches and run again. The report shows the losing rides along with a button that turns the
@@ -146,10 +202,13 @@ Set the speed to 50× and each run takes a few seconds.
    cabs inside with a dashed red ring driving out, and routes bending around the zone; the status bar fills with counts.
    Press **Start** to continue and check the *Threat zone* section of the report. **Move threat** and **Clear threat** do what they say;
    Esc cancels a pending click.
+7. Hover over any moving cab: the tooltip compares its route to the next stop with the original x-then-y route (distance, left and
+   right turns, turn time, total). A small red dot on a cab means it's waiting at a light. After the run, see *Traffic lights* in the report.
+   Set *Right-turn delay* to 0 to switch the lights off.
 
 ## Tests
 
-`node test/sim.test.js` runs 39 tests, all passing.
+`node test/sim.test.js` runs 47 tests, all passing.
 
 The 16 original ones still check the core rules: capacity, the detour cap, the ping radius, patience, pay and fare accounting.
 Three of them were adjusted because pay and fares now work differently by design.
@@ -164,6 +223,16 @@ The new ones cover:
 - **Regression:** the original rules reproducing the old output exactly.
 - **Threat zone:** one test per edge case, with the safety rules (nothing routed into the zone, two aboard at most) checked
   every 0.1 s of simulated time.
+- **Traffic lights:**
+  - the 75% / 125% / free rules;
+  - the left-turn route chosen over the right-turn one (13 s vs 14 s, same 10 blocks);
+  - a target directly behind handled with three lefts and no U-turn (14 s, not 17 s);
+  - the exact formula matching the full search everywhere;
+  - a longer route never being faster;
+  - a cab really waiting at the light and arriving exactly when planned, in a busy city too;
+  - lights and a threat zone together.
+
+  All the earlier tests also run with the lights on.
 
 | Threat-zone case | What the test checks |
 |---|---|
@@ -196,7 +265,7 @@ across the city it wouldn't show much.
 ```
 index.html        page layout and the threat-zone controls
 styles.css        light and dark themes
-js/sim.js         the engine: matching, routing, pay, pricing, guarantee, threat zone
+js/sim.js         the engine: matching, turn-aware routing, pay, pricing, guarantee, threat zone
 js/metrics.js     comparisons, summary numbers, replays for the report
 js/render.js      the maps, including the zone and the detours around it
 js/report.js      the end-of-run report
@@ -211,5 +280,6 @@ test/sim.test.js  tests
 - Demand is spread evenly. Real commute patterns would raise match rates.
 - Waiting time isn't covered by any promise. About a quarter of pool riders still arrive later than their solo twin.
 - The guarantee settles each time a cab becomes free, so a cab that's still busy at the end of the run isn't settled yet.
+- Turns only cost time while driving; setting off from a stop is free, and the lights have no red/green cycle (every right turn waits the same).
 - One threat zone at a time, and its radius can't change mid-run. Near the zone, the drawn ping diamond is only a guide:
   which cabs actually get the request is decided by the real driving distance around the zone.
