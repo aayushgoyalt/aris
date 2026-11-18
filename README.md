@@ -45,7 +45,7 @@ different ping radii to find the best setting, and points out three things the r
 
 ## What I changed
 
-Before changing anything I measured the original. Four problems stood out:
+Before changing anything I measured the original (default settings, no traffic lights). Four problems stood out:
 
 1. Nothing stopped a driver losing money on a pooled ride. With low pay and high running costs, both of which the
    sidebar allows, pooled rides regularly ended with the driver out of pocket.
@@ -56,7 +56,8 @@ Before changing anything I measured the original. Four problems stood out:
 4. The rider already in the car absorbs most of the detour (1.21× their solo time, against 1.06× for the rider who
    joins), but both got the same discount.
 
-The additions below can each be switched on or off in the sidebar:
+Here's what I added. The first two fix those problems; the threat zone and traffic lights were new requirements that came later.
+Everything except the comparison panel can be switched off in the sidebar.
 
 **Driver guarantee.** When a cab that carried a pool rider becomes free again, the driver is topped up so they earn
 at least what those riders would have paid solo, and never end below $0 after running costs. The unpaid drive to
@@ -89,7 +90,7 @@ zone changes nothing unless you declare one.
 
 ## Results
 
-These are averages over five cities with traffic lights on (the default). Original pricing on the left of each arrow, the new
+These are averages over five cities with traffic lights on (the default). Original rules on the left of each arrow, the new
 pricing and guarantee on the right.
 
 | | Default fleet (30 cabs) | Too few cabs (15) | Too many cabs (60) |
@@ -118,9 +119,9 @@ Only one zone can be active at a time.
 When it's declared:
 
 - **Cabs inside** drive straight out, and a cab heading in turns around. They take no new work until they're out.
-- **Routes** that went through it are recalculated around it. While it's active, all distances are real driving distances around
-  the zone (a breadth-first search over the open grid). ETAs, the ping radius and the detour cap all use them, and cabs drive
-  exactly the route the planner timed. The map draws those detours.
+- **Routes** that went through it are recalculated around it. While it's active, every distance is the real driving time around
+  the zone: a search over the open grid that also counts the lights (see *Traffic lights*). ETAs, the ping radius and the detour
+  cap all use it, and cabs drive exactly the route the planner timed. The map draws those detours.
 - **Riders waiting for a match** whose pickup or destination is inside, or who have no way around it, are cancelled and never charged.
   New requests like that are refused, and the reason is recorded.
 - **Riders already matched** whose cab can no longer reach them on time go back in the queue, with their patience clock restarted.
@@ -172,19 +173,19 @@ microsecond. Matching, pooled insertions, re-dispatch, the ping radius (now "wit
 **Can a longer route be faster? Not with this rule, and here's why.** Steering around one right turn means looping a block:
 two extra blocks and three lefts. That's 2 s + 3 × 3 s = 11 s instead of the 4 s right turn. The same holds for any delay: three lefts
 cost 2.25 right turns. And among equally short routes there's always one whose turns are lefts. A longer route would only win if
-a left cost less than a third of a right. A test checks this for every position, direction and target on a 12 × 12 grid.
+a left cost less than a third of a right. A test checks this for every position and direction on a 12 × 12 grid, against a spread
+of targets; a separate check over every target on a 15 × 15 grid, with and without a threat zone, found no exception either.
 
 What the lights do change is **which of the equally short routes is taken**. The original engine always drove the whole x leg first,
-so about half its trips made a right turn where an equally short left-turn route existed. The report shows a real leg from the run,
-for example:
+so it often made a right turn where an equally short left-turn route existed. The report shows a real leg from the run, for example:
 
 | (41, 1) → (35, 0) | Distance | Left turns | Right turns | Turn time | Total |
 |---|---|---|---|---|---|
 | Fastest route (taken) | 7 blocks | 1 | 0 | 3 s | 10 s |
 | Original x-then-y route | 7 blocks | 0 | 1 | 4 s | 11 s |
 
-In the default run, cabs in the pool city made 274 left turns and 7 right turns. On 144 legs the fastest route beat the x-then-y
-route, saving 144 s of driving. Hovering over a cab shows the same comparison for its next leg.
+In the default run, cabs in the pool city made 274 left turns and 7 right turns. On 144 of 338 legs (about four in ten) the fastest
+route beat the x-then-y route, saving 144 s of driving in total. Hovering over a cab shows the same comparison for its next leg.
 
 ## Try it
 
@@ -232,13 +233,14 @@ The new ones cover:
   - a cab really waiting at the light and arriving exactly when planned, in a busy city too;
   - lights and a threat zone together.
 
-  All the earlier tests also run with the lights on.
+  The core rule checks (capacity, detour cap, ping radius, pay, fares, guarantee) and the busy-city threat-zone test run with the
+  lights on. The hand-built cases that assert exact times, and the regression against the original, run with them off.
 
 | Threat-zone case | What the test checks |
 |---|---|
 | No cabs nearby | Nobody is evacuated; only trips touching the zone are refused |
 | Around a cab | The cab drives out, then serves a rider normally |
-| Across an active route | Rerouted 6 blocks round a radius-2 zone, arriving at exactly the planned time (26 s instead of 20 s), with a detour credit |
+| Across an active route | Rerouted 6 blocks round a radius-2 zone, arriving at exactly the planned time (26 s instead of 20 s, lights off), with a detour credit |
 | Over a pickup | The ride is cancelled, nothing is charged, the cab is freed |
 | Over a destination | Dropped at (17, 0) instead of (20, 0), paying 85% of the fare; if the zone is cleared in time, they go all the way |
 | A pooled ride | Both riders delivered, still sharing, both rerouted |
@@ -267,7 +269,7 @@ index.html        page layout and the threat-zone controls
 styles.css        light and dark themes
 js/sim.js         the engine: matching, turn-aware routing, pay, pricing, guarantee, threat zone
 js/metrics.js     comparisons, summary numbers, replays for the report
-js/render.js      the maps, including the zone and the detours around it
+js/render.js      the maps: routes as driven, the threat zone, cabs waiting at lights
 js/report.js      the end-of-run report
 js/app.js         controls, playback, background re-runs
 test/sim.test.js  tests
@@ -281,5 +283,6 @@ test/sim.test.js  tests
 - Waiting time isn't covered by any promise. About a quarter of pool riders still arrive later than their solo twin.
 - The guarantee settles each time a cab becomes free, so a cab that's still busy at the end of the run isn't settled yet.
 - Turns only cost time while driving; setting off from a stop is free, and the lights have no red/green cycle (every right turn waits the same).
+- U-turns are avoided and only happen where no other move exists, at 125% of a right turn. That's my reading of the requirement.
 - One threat zone at a time, and its radius can't change mid-run. Near the zone, the drawn ping diamond is only a guide:
   which cabs actually get the request is decided by the real driving distance around the zone.
