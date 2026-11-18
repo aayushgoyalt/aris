@@ -7,8 +7,8 @@ alone. The riders, their request times and the cab start positions are identical
 the two maps comes from pooling and nothing else.
 
 On top of the original simulation I added a driver earnings guarantee, fairer pool pricing, an optional batch matcher,
-a side-by-side comparison with the original rules, a threat zone you can declare anywhere on the map while the city runs,
-and traffic lights that make right turns cost time.
+a side-by-side comparison with the original rules, threat zones you can declare anywhere on the map while the city runs
+(as many as you like), and traffic lights that make right turns cost time.
 
 ## Running it
 
@@ -75,8 +75,8 @@ side by side. Runs are deterministic, so both columns are real results rather th
 rider-cab pairs across the whole queue, while still favouring people who've waited longest. It helps when demand is
 dense and does nothing otherwise, which is why it's off by default.
 
-**Threat zone.** A closed circular area you can declare at any moment by clicking the map. Cabs are routed around it, and every
-affected ride is handled safely. More detail below.
+**Threat zones.** Closed circular areas you can declare at any moment by clicking the map, as many as you like. Cabs are routed
+around them, and every affected ride is handled safely. More detail below.
 
 **Traffic lights.** Right turns stop at a light and cost time; left turns cost less. Routes are chosen by total time, not
 distance. More detail below.
@@ -110,13 +110,21 @@ Pricing and the guarantee only move money, so rides delivered and wait times don
 that changes who rides when: with 400 riders it delivered 208 rides instead of 204 and cut the average wait by 3 s, but with
 too few cabs it made no real difference. That's why it stays off by default.
 
-## Threat zone
+## Threat zones
 
-The zone is a circle with a fixed radius (6 blocks by default, set in the sidebar before the run). When you declare it,
-every intersection inside it closes in both cities at the same moment, so the comparison between them stays fair.
-Only one zone can be active at a time.
+Each zone is a circle with a fixed radius (6 blocks by default, set in the sidebar before the run; every zone in a run has the
+same radius). You can declare as many as you like, at any moment, and they may overlap. Each one closes every intersection
+inside it in both cities at the same moment, so the comparison between them stays fair.
 
-When it's declared:
+**On screen:**
+- **Add threat**, then click intersections on either map. It stays armed, so each click adds another zone; press it again
+  (*Done adding*) or Esc to stop.
+- **Remove threat**, then click inside a zone to lift just that one.
+- **Clear all** lifts every zone.
+
+Lifting a zone reopens only the area no other zone still covers.
+
+Each time a zone is added:
 
 - **Cabs inside** drive straight out, and a cab heading in turns around. They take no new work until they're out.
 - **Routes** that went through it are recalculated around it. While it's active, every distance is the real driving time around
@@ -129,12 +137,14 @@ When it's declared:
   - If their destination is inside, they're dropped at the nearest safe intersection the cab can reach and pay only for the share of the trip covered.
   - If the way round pushes them past the 1.5× limit, they're delivered anyway, but their drop-off time is frozen so no later
     match can delay them further.
-  - If the zone is cleared before they arrive, they're taken to their real destination after all.
+  - If the zone over their destination is lifted before they arrive, they're taken to their real destination after all.
+    Lifting some other zone changes nothing for them.
 - Two passengers at most, the driver guarantee and non-negative fares all still hold.
 
-The status bar under the maps keeps count for each city: cabs rerouted, cabs that drove out, rides cancelled or refused, riders back
-in the queue, and riders dropped short. The report adds a *Threat zone* section with the same numbers broken down by reason. The radius sweep
-and the comparison replay the zone at the same moment, so their numbers match the run you watched.
+The status bar under the maps lists the active zones and keeps count for each city: cabs rerouted, cabs that drove out, rides
+cancelled or refused, riders back in the queue, and riders dropped short. The report adds a *Threat zones* section listing each zone with
+when it was added and lifted, and the same numbers broken down by reason. The radius sweep and the comparison replay every add and
+removal at the same moment, so their numbers match the run you watched.
 
 ## Traffic lights
 
@@ -199,17 +209,17 @@ Set the speed to 50× and each run takes a few seconds.
    guarantee back on.
 4. Set cabs to 60. The discount given to riders who never shared drops by about two-thirds.
 5. Click **Original rules** and run. The comparison now puts your run (original rules) next to the new defaults.
-6. Start a run, press **Stop**, press **Declare threat**, and click the middle of a map. You'll see a red circle in both cities,
-   cabs inside with a dashed red ring driving out, and routes bending around the zone; the status bar fills with counts.
-   Press **Start** to continue and check the *Threat zone* section of the report. **Move threat** and **Clear threat** do what they say;
-   Esc cancels a pending click.
+6. Start a run, press **Stop**, press **Add threat**, and click two or three spots on a map. You'll see red circles in both cities,
+   cabs inside with a dashed red ring driving out, and routes bending around the zones; the status bar lists them with counts.
+   Press **Remove threat** and click one to lift it, or **Clear all**. Press **Start** to continue, then check the *Threat zones*
+   section of the report.
 7. Hover over any moving cab: the tooltip compares its route to the next stop with the original x-then-y route (distance, left and
    right turns, turn time, total). A small red dot on a cab means it's waiting at a light. After the run, see *Traffic lights* in the report.
    Set *Right-turn delay* to 0 to switch the lights off.
 
 ## Tests
 
-`node test/sim.test.js` runs 47 tests, all passing.
+`node test/sim.test.js` runs 51 tests, all passing.
 
 The 16 original ones still check the core rules: capacity, the detour cap, the ping radius, patience, pay and fare accounting.
 Three of them were adjusted because pay and fares now work differently by design.
@@ -247,7 +257,10 @@ The new ones cover:
 | A promise that can't be kept | Back in the queue, patience restarted, then rematched and delivered |
 | No feasible route | A zone that cuts off a corner: the rider aboard is dropped at the closest reachable point; a new trip into the corner is refused |
 | Many requests at once | Busy cities, including batch matching and a big zone: every rider accounted for |
-| Replay | The comparison re-run with the zone matches the live run exactly |
+| Several zones at once | Three zones closed and avoided every step; lifting one reopens only its area |
+| Overlapping zones | Lifting one keeps the shared area closed while the other still covers it |
+| Lifting the right zone | A rider dropped short goes all the way only when the zone over their destination is lifted |
+| Replay | The comparison re-run with adds and removals matches the live run exactly |
 
 ## Why the ping radius is a diamond
 
@@ -265,7 +278,7 @@ across the city it wouldn't show much.
 ## Files
 
 ```
-index.html        page layout and the threat-zone controls
+index.html        page layout and the threat-zone controls (add, remove, clear all)
 styles.css        light and dark themes
 js/sim.js         the engine: matching, turn-aware routing, pay, pricing, guarantee, threat zone
 js/metrics.js     comparisons, summary numbers, replays for the report
@@ -284,5 +297,5 @@ test/sim.test.js  tests
 - The guarantee settles each time a cab becomes free, so a cab that's still busy at the end of the run isn't settled yet.
 - Turns only cost time while driving; setting off from a stop is free, and the lights have no red/green cycle (every right turn waits the same).
 - U-turns are avoided and only happen where no other move exists, at 125% of a right turn. That's my reading of the requirement.
-- One threat zone at a time, and its radius can't change mid-run. Near the zone, the drawn ping diamond is only a guide:
-  which cabs actually get the request is decided by the real driving distance around the zone.
+- Every threat zone has the same radius, and it can't change mid-run. Near a zone, the drawn ping diamond is only a guide:
+  which cabs actually get the request is decided by the real driving distance around the zones.

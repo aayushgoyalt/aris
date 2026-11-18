@@ -192,9 +192,9 @@
 
     var cabs = w.cabs, i, k, c, color, x, y;
 
-    // Threat zone: every intersection inside the circle is closed.
-    if (w.zone) {
-      var zx = g.pad + w.zone.cx * cell, zy = g.pad + w.zone.cy * cell, zr = (w.zone.r + 0.5) * cell;
+    // Threat zones: every intersection inside any circle is closed.
+    if (w.zone) w.zone.list.forEach(function (zone) {
+      var zx = g.pad + zone.cx * cell, zy = g.pad + zone.cy * cell, zr = (zone.r + 0.5) * cell;
       ctx.save();
       ctx.fillStyle = th.bad;
       ctx.globalAlpha = 0.16;
@@ -214,7 +214,7 @@
       ctx.moveTo(zx + zs, zy - zs); ctx.lineTo(zx - zs, zy + zs);
       ctx.stroke();
       ctx.restore();
-    }
+    });
 
     // Ping radius of new requests: every cab inside this diamond is asked.
     var R = w.cfg.pingRadius * cell;

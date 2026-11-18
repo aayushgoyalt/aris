@@ -43,7 +43,7 @@
     },
     {
       group: 'Threat zone', items: [
-        { key: 'zoneRadius', label: 'Threat zone radius', unit: 'blocks', min: 1, max: 20, step: 1, hint: 'Fixed radius of the zone. Press “Declare threat” under the maps, then click a spot on either map, at any time during the run.' },
+        { key: 'zoneRadius', label: 'Threat zone radius', unit: 'blocks', min: 1, max: 20, step: 1, hint: 'Fixed radius of every zone. Press “Add threat” under the maps, then click spots on either map, as many as you like, at any time during the run.' },
       ],
     },
     {
@@ -76,7 +76,7 @@
     clockTotal: $('clock-total'), progress: $('progress'),
     statsPool: $('stats-pool'), statsBase: $('stats-base'), subPool: $('sub-pool'),
     live: $('live'), report: $('report'), reportPanel: $('report-panel'), tooltip: $('tooltip'),
-    zoneBtn: $('btn-zone'), zoneClear: $('btn-zone-clear'), zoneStatus: $('zone-status'),
+    zoneBtn: $('btn-zone'), zoneRemove: $('btn-zone-remove'), zoneClear: $('btn-zone-clear'), zoneStatus: $('zone-status'),
   };
 
   var state = {
@@ -90,7 +90,8 @@
     effSpeed: null,
     summary: null,
     hover: null, // { view, cab }
-    arming: false, // next map click declares the threat zone
+    arming: null, // 'add' or 'remove': what a click on the map does to threat zones
+    zoneNote: '',
   };
 
   var views = {
@@ -406,10 +407,12 @@
 
   // ------------------------------------------------------------ threat zone
 
-  function setArming(on) {
-    state.arming = !!on;
-    document.body.classList.toggle('arming', state.arming);
-    if (els.zoneBtn) els.zoneBtn.classList.toggle('is-armed', state.arming);
+  function setArming(mode) {
+    state.arming = mode || null;
+    state.zoneNote = '';
+    document.body.classList.toggle('arming', !!state.arming);
+    if (els.zoneBtn) els.zoneBtn.classList.toggle('is-armed', state.arming === 'add');
+    if (els.zoneRemove) els.zoneRemove.classList.toggle('is-armed', state.arming === 'remove');
     if (state.sim) updateZoneUi();
   }
 
@@ -420,18 +423,22 @@
   }
 
   function updateZoneUi() {
-    var sim = state.sim, z = sim.pool.zone;
+    var sim = state.sim, zones = sim.pool.zone ? sim.pool.zone.list : [];
     var open = state.status !== 'finished';
     els.zoneBtn.disabled = !open;
-    els.zoneBtn.textContent = state.arming ? 'Click a spot on a map…' : z ? 'Move threat' : 'Declare threat';
-    els.zoneClear.disabled = !z || !open;
+    els.zoneBtn.textContent = state.arming === 'add' ? 'Done adding' : 'Add threat';
+    els.zoneRemove.disabled = !zones.length || !open;
+    els.zoneRemove.textContent = state.arming === 'remove' ? 'Done removing' : 'Remove threat';
+    els.zoneClear.disabled = !zones.length || !open;
+    var counts = ' — With Pool: ' + zoneCounts(sim.pool) + ' | No Pool: ' + zoneCounts(sim.base);
+    var list = zones.map(function (z) { return '(' + z.cx + ', ' + z.cy + ') from ' + fmt.sec(z.at, 0); }).join(', ');
     var text;
-    if (state.arming) text = 'Click any intersection on either map. The same zone (radius ' + state.cfg.zoneRadius + ' blocks) is declared in both cities. Esc cancels.';
-    else if (z) text = '<b>Threat zone at (' + z.cx + ', ' + z.cy + '), radius ' + z.r + ' blocks</b>, declared at ' + fmt.sec(z.at, 0)
-      + ' — With Pool: ' + zoneCounts(sim.pool) + ' | No Pool: ' + zoneCounts(sim.base);
-    else if (sim.pool.zoneHistory.length) text = 'Threat cleared. With Pool: ' + zoneCounts(sim.pool) + ' | No Pool: ' + zoneCounts(sim.base);
-    else text = open ? 'Declare a threat zone at any moment: no cab will be routed through it.' : '';
-    els.zoneStatus.innerHTML = text;
+    if (state.arming === 'add') text = 'Click intersections on either map to add zones (radius ' + state.cfg.zoneRadius + ' blocks), as many as you like. The same zones are declared in both cities. Esc or “Done adding” stops.';
+    else if (state.arming === 'remove') text = 'Click inside a zone on either map to lift it. Esc or “Done removing” stops.';
+    else if (zones.length) text = '<b>' + zones.length + (zones.length === 1 ? ' threat zone' : ' threat zones') + '</b>, radius ' + zones[0].r + ' blocks: ' + list + counts;
+    else if (sim.pool.zoneHistory.length) text = 'All threats lifted.' + counts;
+    else text = open ? 'Add threat zones at any moment: no cab will be routed through them.' : '';
+    els.zoneStatus.innerHTML = (state.zoneNote ? state.zoneNote + ' ' : '') + text;
   }
 
   // ------------------------------------------------------------ hover inspector
@@ -784,10 +791,15 @@
 
   els.zoneBtn.addEventListener('click', function () {
     if (state.status === 'finished') return;
-    setArming(!state.arming);
+    setArming(state.arming === 'add' ? null : 'add');
+  });
+  els.zoneRemove.addEventListener('click', function () {
+    if (state.status === 'finished') return;
+    setArming(state.arming === 'remove' ? null : 'remove');
   });
   els.zoneClear.addEventListener('click', function () {
     state.sim.clearZone();
+    setArming(null);
     updateUi();
   });
   [views.pool, views.base].forEach(function (view) {
@@ -795,8 +807,15 @@
       if (!state.arming || state.status === 'finished') return;
       var rect = view.canvas.getBoundingClientRect();
       var node = view.nodeAt(e.clientX - rect.left, e.clientY - rect.top);
-      state.sim.declareZone(node.x, node.y);
-      setArming(false);
+      if (state.arming === 'add') {
+        state.sim.declareZone(node.x, node.y); // stays armed: click again to add another
+        state.zoneNote = '';
+      } else if (!state.sim.removeZoneAt(node.x, node.y)) {
+        state.zoneNote = '<b>No threat zone there.</b>';
+      } else {
+        state.zoneNote = '';
+        if (!state.sim.pool.zone) setArming(null);
+      }
       updateUi();
     });
   });

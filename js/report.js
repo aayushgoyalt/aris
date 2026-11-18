@@ -735,7 +735,8 @@
     if (!zp.declared) return '';
     var when = zp.history.map(function (h) {
       return '(' + h.cx + ', ' + h.cy + '), radius ' + h.r + ' blocks, from ' + fmt.sec(h.at, 0) + (h.clearedAt != null ? ' to ' + fmt.sec(h.clearedAt, 0) : ' to the end');
-    }).join('; then ');
+    }).join('; ');
+    var many = zp.history.length > 1;
     var reasons = function (z, key) { return z.byReason[key] || 0; };
     var groups = [['Threat zone', [
       ['Cabs rerouted around it', zb.rerouted, zp.rerouted, fmt.int, 'int', null],
@@ -749,9 +750,9 @@
       ['Fare refunded for distance not covered', zb.refund, zp.refund, fmt.money, 'money', null],
       ['Riders delivered past the detour cap (safety first)', zb.capExceptions, zp.capExceptions, fmt.int, 'int', null],
     ]]];
-    return '<section class="rsec"><h3>Threat zone</h3>'
-      + '<p class="lead">Declared at ' + when + '. Every intersection inside was closed in both cities at the same moment. '
-      + 'No cab was routed through it; cabs caught inside drove straight out. Cancelled riders were never charged; riders dropped short paid only for the distance covered.</p>'
+    return '<section class="rsec"><h3>' + (many ? 'Threat zones' : 'Threat zone') + '</h3>'
+      + '<p class="lead">' + (many ? zp.history.length + ' zones: ' : 'Declared at ') + when + '. Every intersection inside was closed in both cities at the same moment. '
+      + 'No cab was routed through ' + (many ? 'them' : 'it') + '; cabs caught inside drove straight out. Cancelled riders were never charged; riders dropped short paid only for the distance covered.</p>'
       + deltaTable(groups, 'No Pool', 'With Pool') + '</section>';
   }
 

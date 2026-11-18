@@ -36,8 +36,9 @@
  *    and never end below $0 after running costs (floor).
  *  - Matching: oldest request first (original), or optionally batch matching:
  *    cheapest rider-cab pair across the queue first, with an age priority.
- *  - Threat zone: a circle of fixed radius declared at any intersection while
- *    the city runs. Every intersection inside it is closed. While it is active,
+ *  - Threat zones: circles of fixed radius declared at any intersection while
+ *    the city runs, as many as needed (they may overlap). Every intersection
+ *    inside any of them is closed. While it is active,
  *    all distances are real driving distances around it (breadth-first search
  *    on the open grid), cabs inside drive out, impossible trips are cancelled
  *    or refused, riders headed into it are dropped at the nearest safe point,
@@ -225,7 +226,8 @@ function definePoolSim(root) {
     this.series = [];
     this.lostLog = [];
     this.episodes = [];  // settled busy stretches, one per cab from busy to idle
-    this.zone = null;    // active threat zone, if any
+    this.zone = null;    // active threat zones: { list, mask } (null when there are none)
+    this.zoneSeq = 0;    // ids for declared zones
     this.zoneHistory = [];
     this.fields = {};    // cached driving-distance fields around the zone, by target node
     this.fieldCount = 0;
@@ -1216,18 +1218,9 @@ function definePoolSim(root) {
     cy = clamp(Math.round(cy), 0, G - 1);
     // Timings before the change, to tell which cabs it reroutes.
     var before = this.cabs.map(function (c) { return c.plan.length ? this.evalPlan(c, c.plan, null, false) : null; }, this);
-    if (this.zone) this.clearZone();
-    var R = cfg.zoneRadius, mask = new Uint8Array(G * G), nodes = 0;
-    for (var y = 0; y < G; y++) {
-      for (var x = 0; x < G; x++) {
-        if ((x - cx) * (x - cx) + (y - cy) * (y - cy) <= R * R + EPS) { mask[x + y * G] = 1; nodes++; }
-      }
-    }
-    this.zone = { cx: cx, cy: cy, r: R, at: this.t, mask: mask, nodes: nodes };
-    this.zoneHistory.push({ cx: cx, cy: cy, r: R, at: this.t, clearedAt: null });
-    this.fields = {};
-    this.fieldCount = 0;
-    this.resetRoutes();
+    var z = { id: ++this.zoneSeq, cx: cx, cy: cy, r: cfg.zoneRadius, at: this.t };
+    this.setZones((this.zone ? this.zone.list : []).concat([z]));
+    this.zoneHistory.push({ id: z.id, cx: cx, cy: cy, r: z.r, at: this.t, clearedAt: null });
 
     // 1. Cabs inside the zone get out first.
     for (i = 0; i < this.cabs.length; i++) this.secureCab(this.cabs[i]);
@@ -1339,21 +1332,71 @@ function definePoolSim(root) {
     }
   };
 
-  World.prototype.clearZone = function () {
-    if (!this.zone) return;
-    var h = this.zoneHistory[this.zoneHistory.length - 1];
-    if (h && h.clearedAt == null) h.clearedAt = this.t;
-    this.zone = null;
+  // Replace the set of active zones: rebuild the closed-intersection mask
+  // (the union of every circle) and drop every cached route.
+  World.prototype.setZones = function (list) {
+    var G = this.cfg.gridSize;
+    if (!list.length) {
+      this.zone = null;
+    } else {
+      var mask = new Uint8Array(G * G), nodes = 0;
+      for (var y = 0; y < G; y++) {
+        for (var x = 0; x < G; x++) {
+          for (var k = 0; k < list.length; k++) {
+            var z = list[k];
+            if ((x - z.cx) * (x - z.cx) + (y - z.cy) * (y - z.cy) <= z.r * z.r + EPS) { mask[x + y * G] = 1; nodes++; break; }
+          }
+        }
+      }
+      this.zone = { list: list, mask: mask, nodes: nodes };
+    }
     this.fields = {};
     this.fieldCount = 0;
     this.resetRoutes();
+  };
+
+  // The active zone covering (x, y), nearest centre first (null if none).
+  World.prototype.zoneAt = function (x, y) {
+    if (!this.zone) return null;
+    var best = null, bestD = Infinity;
+    this.zone.list.forEach(function (z) {
+      var d = (x - z.cx) * (x - z.cx) + (y - z.cy) * (y - z.cy);
+      if (d <= z.r * z.r + EPS && d < bestD) { best = z; bestD = d; }
+    });
+    return best;
+  };
+
+  // Lift one zone (by id) and reopen whatever no other zone still covers.
+  World.prototype.removeZone = function (id) {
+    if (!this.zone) return false;
+    var rest = this.zone.list.filter(function (z) { return z.id !== id; });
+    if (rest.length === this.zone.list.length) return false;
+    this.zoneHistory.forEach(function (h) { if (h.id === id && h.clearedAt == null) h.clearedAt = this.t; }, this);
+    this.setZones(rest);
+    this.afterZonesLifted();
+    return true;
+  };
+
+  // Lift every zone.
+  World.prototype.clearZone = function () {
+    if (!this.zone) return;
+    this.zoneHistory.forEach(function (h) { if (h.clearedAt == null) h.clearedAt = this.t; }, this);
+    this.setZones([]);
+    this.afterZonesLifted();
+  };
+
+  World.prototype.afterZonesLifted = function () {
     var self = this;
     this.cabs.forEach(function (cab) {
-      cab.evac = null;
-      // Riders being dropped short of a closed destination go all the way
-      // again, if that still fits everyone in the cab.
+      // A cab still inside another zone keeps driving out; the others stop.
+      if (cab.evac) {
+        var inside = cab.next ? self.blocked(cab.next.x, cab.next.y) : self.blocked(cab.x, cab.y);
+        cab.evac = inside ? nearestOpen(self, cab.next ? cab.next.x : cab.x, cab.next ? cab.next.y : cab.y) : null;
+      }
+      // Riders being dropped short of a destination that has reopened go all
+      // the way again, if that still fits everyone in the cab.
       cab.onboard.forEach(function (r) {
-        if (!r.earlyDrop) return;
+        if (!r.earlyDrop || self.blocked(r.dx, r.dy)) return;
         var plan = cab.plan.map(function (s) { return s.rider === r && s.type === 'dropoff' ? dropoffStop(r) : s; });
         if (self.evalPlan(cab, plan, null, true)) { cab.plan = plan; r.earlyDrop = null; cab.planVersion++; }
       });
@@ -1421,6 +1464,20 @@ function definePoolSim(root) {
     this.base.declareZone(x, y);
   };
 
+  // Lift the zone covering (x, y); returns false if there is none there.
+  Simulation.prototype.removeZoneAt = function (x, y) {
+    var z = this.pool.zoneAt(x, y);
+    if (!z) return false;
+    this.removeZone(z.id);
+    return true;
+  };
+
+  Simulation.prototype.removeZone = function (id) {
+    this.zoneEvents.push({ t: this.t, type: 'remove', id: id });
+    this.pool.removeZone(id);
+    this.base.removeZone(id);
+  };
+
   Simulation.prototype.clearZone = function () {
     if (!this.pool.zone) return;
     this.zoneEvents.push({ t: this.t, type: 'clear' });
@@ -1433,6 +1490,7 @@ function definePoolSim(root) {
     while (from < events.length && events[from].t <= this.t + EPS) {
       var e = events[from++];
       if (e.type === 'declare') this.declareZone(e.x, e.y);
+      else if (e.type === 'remove') this.removeZone(e.id);
       else this.clearZone();
     }
     return from;

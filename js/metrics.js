@@ -116,8 +116,8 @@ function definePoolMetrics(root) {
     var dropped = w.riders.filter(function (r) { return r.earlyDrop && r.state === 'done'; });
     return {
       declared: w.zoneHistory.length,
-      history: w.zoneHistory.map(function (h) { return { cx: h.cx, cy: h.cy, r: h.r, at: h.at, clearedAt: h.clearedAt }; }),
-      active: w.zone ? { cx: w.zone.cx, cy: w.zone.cy, r: w.zone.r } : null,
+      history: w.zoneHistory.map(function (h) { return { id: h.id, cx: h.cx, cy: h.cy, r: h.r, at: h.at, clearedAt: h.clearedAt }; }),
+      active: w.zone ? w.zone.list.map(function (z) { return { id: z.id, cx: z.cx, cy: z.cy, r: z.r }; }) : [],
       rerouted: T.zoneRerouted, evacuated: T.zoneEvacuated, cancelled: T.zoneCancelled, refused: T.zoneRefused,
       requeued: T.zoneRequeued, earlyDrops: T.zoneEarlyDrops, capExceptions: T.zoneCapExceptions,
       refund: T.zoneRefund, byReason: byReason, earlyDelivered: dropped.length,

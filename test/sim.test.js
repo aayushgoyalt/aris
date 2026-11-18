@@ -419,7 +419,8 @@ function checkZone(w) {
   }
 }
 
-// A hand-built city with zone events: [{ t, x, y }] declares, [{ t, clear: true }] clears.
+// A hand-built city with zone events: [{ t, x, y }] declares, [{ t, x, y, remove: true }] lifts the
+// zone covering (x, y), [{ t, clear: true }] lifts them all.
 function zoneCity(riders, over, events, cabs) {
   const cfg = S.normalizeConfig(Object.assign({ cabs: 1, riders: 0, duration: 120, pingRadius: 100, zoneRadius: 2, rightTurnDelay: 0 }, over));
   const w = new S.World(cfg, { cabs: cabs || [{ x: 0, y: 0 }], riders: riders.map((r, i) => Object.assign({ id: i, optIn: true }, r)) }, true);
@@ -427,7 +428,9 @@ function zoneCity(riders, over, events, cabs) {
   while (w.t < cfg.duration - EPS) {
     while (evs.length && evs[0].t <= w.t + EPS) {
       const e = evs.shift();
-      if (e.clear) w.clearZone(); else w.declareZone(e.x, e.y);
+      if (e.clear) w.clearZone();
+      else if (e.remove) w.removeZone(w.zoneAt(e.x, e.y).id);
+      else w.declareZone(e.x, e.y);
     }
     w.step();
     checkZone(w);
@@ -580,6 +583,52 @@ test('zone: the comparison re-run replays the zone exactly', () => {
   const live = M.scorecard(M.summarize(s));
   const replay = M.scorecardAt(S.DEFAULTS, s.t, s.zoneEvents);
   assert.deepStrictEqual(replay, live);
+});
+
+test('zones: several at once -> every one is closed and avoided; lifting one reopens only its area', () => {
+  const s = sim({ zoneRadius: 5 });
+  let phase = 0;
+  while (!s.done) {
+    if (phase === 0 && s.t >= 60 - EPS) { s.declareZone(12, 12); s.declareZone(37, 37); s.declareZone(12, 37); phase = 1; }
+    if (phase === 1 && s.t >= 150 - EPS) { assert(s.removeZoneAt(37, 37)); phase = 2; }
+    s.step();
+    checkZone(s.pool); checkZone(s.base);
+    if (phase === 1) for (const [x, y] of [[12, 12], [37, 37], [12, 37]]) assert(s.pool.blocked(x, y) && s.base.blocked(x, y));
+    if (phase === 2) {
+      assert(!s.pool.blocked(37, 37), 'lifted zone reopened');
+      assert(s.pool.blocked(12, 12) && s.pool.blocked(12, 37), 'the other zones stay closed');
+    }
+  }
+  assert.strictEqual(s.pool.zone.list.length, 2);
+  assert.strictEqual(s.pool.zoneHistory.filter((h) => h.clearedAt != null).length, 1);
+  assert(!s.removeZoneAt(37, 37), 'nothing left to lift there');
+});
+
+test('zones: overlapping -> lifting one keeps the shared area closed while the other covers it', () => {
+  const w = zoneCity([], { zoneRadius: 3, duration: 5 }, [{ t: 0, x: 20, y: 20 }, { t: 0, x: 23, y: 20 }, { t: 1, x: 20, y: 20, remove: true }]);
+  assert(w.blocked(22, 20), 'still covered by the second zone');
+  assert(!w.blocked(18, 20), 'only the first zone covered this');
+  assert.strictEqual(w.zone.list.length, 1);
+});
+
+test('zones: a rider dropped short goes all the way only when the zone over their destination is lifted', () => {
+  // Destination (20,0) is under zone A; zone B at (5,30) has nothing to do with it.
+  const keep = zoneCity([{ requestAt: 0, ox: 0, oy: 0, dx: 20, dy: 0 }], {}, [{ t: 5, x: 20, y: 0 }, { t: 5, x: 5, y: 30 }, { t: 8, x: 5, y: 30, remove: true }]);
+  assert.deepStrictEqual(keep.riders[0].earlyDrop, { x: 17, y: 0 }, 'lifting the other zone changes nothing');
+  const go = zoneCity([{ requestAt: 0, ox: 0, oy: 0, dx: 20, dy: 0 }], {}, [{ t: 5, x: 20, y: 0 }, { t: 5, x: 5, y: 30 }, { t: 8, x: 20, y: 0, remove: true }]);
+  assert.strictEqual(go.riders[0].earlyDrop, null);
+  assert(Math.abs(go.riders[0].dropoffAt - 20) < 1e-6);
+});
+
+test('zones: the comparison re-run replays adds and removals exactly', () => {
+  const s = sim({});
+  while (!s.done) {
+    if (Math.abs(s.t - 60) < 1e-6) { s.declareZone(15, 15); s.declareZone(35, 35); }
+    if (Math.abs(s.t - 120) < 1e-6) s.removeZoneAt(15, 15);
+    if (Math.abs(s.t - 180) < 1e-6) s.declareZone(25, 10);
+    s.step();
+  }
+  assert.deepStrictEqual(M.scorecardAt(S.DEFAULTS, s.t, s.zoneEvents), M.scorecard(M.summarize(s)));
 });
 
 // ------------------------------------------------------------ traffic lights
